@@ -1,5 +1,8 @@
+# shellcheck shell=bash
 # Pinned third-party versions, shared by scripts/ and .github/workflows/.
-# Sourced, not executed.
+# Sourced, not executed -- so every variable here is "unused" from shellcheck's
+# point of view, and consumed by whichever script sourced it.
+# shellcheck disable=SC2034
 
 # e9patch: v1.0.1 plus "Fix UB on empty trampoline template entries" (#112).
 # That fix is not in any tag, so we pin the commit.
@@ -15,6 +18,10 @@ FFMPEG_TAG=n6.0.1
 # own binary tops out at GLIBC_2.27, and Blackmagic's supported baseline for
 # Resolve 21 is Rocky Linux 8 == glibc 2.28.  Anything we ship must load there.
 MAX_GLIBC=2.28
+# Same idea for the C++ runtime: Rocky Linux 8 ships gcc 8's libstdc++, which
+# provides up to GLIBCXX_3.4.25.  A glibc-clean C++ binary can still fail to load
+# because it wants a newer libstdc++, so e9tool is checked against this too.
+MAX_GLIBCXX=3.4.25
 
 # The four bundled FFmpeg libraries we replace, by exact filename.
 FFMPEG_LIBS="libavcodec.so.60.3.100 libavformat.so.60.3.100 libavutil.so.58.2.100 libswscale.so.7.1.100"

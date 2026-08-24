@@ -13,6 +13,11 @@
 #
 set -euo pipefail
 
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+MAX_GLIBCXX=""
+# shellcheck source=versions.sh
+[ -r "$HERE/versions.sh" ] && . "$HERE/versions.sh"
+
 [ $# -ge 2 ] || { echo "usage: $0 MAX_GLIBC FILE..." >&2; exit 2; }
 MAX="$1"; shift
 
@@ -38,6 +43,26 @@ for f in "$@"; do
         rc=1
     else
         printf '  %-40s GLIBC_%s  (<= %s)  ok\n' "$(basename "$f")" "$worst" "$MAX"
+    fi
+
+    # A C++ binary can be glibc-clean and still refuse to load because it wants
+    # a newer libstdc++ than the target has -- so check that ceiling too.
+    if [ -n "$MAX_GLIBCXX" ] && readelf -dW "$f" 2>/dev/null | grep -q 'libstdc++'; then
+        cxxworst=""; cxxworstk=0
+        while read -r v; do
+            k="$(printf '%s' "$v" | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 }')"
+            if [ "$k" -gt "$cxxworstk" ]; then cxxworstk="$k"; cxxworst="$v"; fi
+        done < <(readelf -V "$f" 2>/dev/null |
+                 grep -oE 'GLIBCXX_[0-9]+\.[0-9]+\.[0-9]+' | sed 's/GLIBCXX_//' | sort -uV)
+        maxcxxk="$(printf '%s' "$MAX_GLIBCXX" | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 }')"
+        if [ -z "$cxxworst" ]; then
+            :
+        elif [ "$cxxworstk" -gt "$maxcxxk" ]; then
+            printf '  %-40s GLIBCXX_%s > %s  FAIL\n' "" "$cxxworst" "$MAX_GLIBCXX" >&2
+            rc=1
+        else
+            printf '  %-40s GLIBCXX_%s (<= %s)  ok\n' "" "$cxxworst" "$MAX_GLIBCXX"
+        fi
     fi
 done
 exit $rc

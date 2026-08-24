@@ -13,7 +13,8 @@
 #
 set -euo pipefail
 
-HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SELF="$(readlink -f "$0")"
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
 ROOT="$(dirname "$HERE")"
 # shellcheck source=versions.sh
 . "$HERE/versions.sh"
@@ -23,8 +24,28 @@ msg()  { printf '  %s\n' "$*"; }
 die()  { printf '\033[31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
+# glibc of the toolchain we would link against.  Anything we ship has to load on
+# Rocky Linux 8 (glibc 2.28) -- the oldest platform Resolve 21 supports -- so a
+# build on a newer host is redone inside a container rather than shipped.
+host_glibc() { ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+$'; }
+ver_key()    { awk -F. '{ printf "%d%03d\n", $1, $2 }' <<<"$1"; }
+glibc_too_new() {
+    [ "${AAC_NO_CONTAINER:-0}" = 1 ] && return 1
+    [ "$(ver_key "$(host_glibc)")" -gt "$(ver_key "$MAX_GLIBC")" ]
+}
+
 do_e9patch() {
-    need git; need gcc; need g++; need make; need xxd
+    need git
+    if glibc_too_new; then
+        info "host glibc $(host_glibc) > $MAX_GLIBC -- building e9patch in a glibc $MAX_GLIBC container"
+        # Not exec: a bare `dev-setup.sh` run still has other components to do.
+        "$HERE/old-glibc-build.sh" --mount "$ROOT" --env AAC_NO_CONTAINER=1 \
+            -- "$SELF" e9patch
+        "$ROOT/scripts/check-elf-compat.sh" "$MAX_GLIBC" \
+            "$ROOT/vendor/e9patch/e9patch" "$ROOT/vendor/e9patch/e9tool"
+        return
+    fi
+    need gcc; need g++; need make; need xxd
     local dst="$ROOT/vendor/e9patch"
     if [ ! -d "$dst/.git" ]; then
         info "Cloning e9patch @ ${E9PATCH_COMMIT:0:12}"
@@ -60,6 +81,9 @@ do_e9patch() {
     rm -f "$dst/aacadd.o"
     check_trampoline "$ROOT/vendor/aacadd"
     msg "vendor/aacadd"
+
+    "$ROOT/scripts/check-elf-compat.sh" "$MAX_GLIBC" \
+        "$dst/e9patch" "$dst/e9tool"
 }
 
 # The trampoline is code spliced into /opt/resolve/bin/resolve, and e9tool

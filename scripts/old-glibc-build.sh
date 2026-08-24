@@ -60,6 +60,9 @@ if ! "$RUNTIME" image inspect "$GLIBC_BUILDER_IMAGE" >/dev/null 2>&1; then
     info "Building $GLIBC_BUILDER_IMAGE from $GLIBC_CONTAINER (first run only)"
     "$RUNTIME" build --platform linux/amd64 -t "$GLIBC_BUILDER_IMAGE" - >&2 <<DOCKERFILE
 FROM $GLIBC_CONTAINER
+# \`which\` and \`xxd\` (vim-common) are NOT in the rockylinux:8 base image, and
+# e9patch's build.sh probes for its tools with \`which\`: without it the build
+# fails claiming gcc is missing when gcc is installed and fine.
 # nasm is not in the base repos -- it lives in PowerTools (renamed CRB in
 # later EL8-alikes), so try both names before installing.  Without it FFmpeg
 # silently configures with --disable-x86asm and builds a far slower library
@@ -70,7 +73,7 @@ RUN dnf -y -q install dnf-plugins-core \
         || dnf config-manager --set-enabled PowerTools) \
     && dnf -y -q install \
         git make gcc gcc-c++ nasm binutils zlib-devel \
-        diffutils findutils perl python3 tar xz which \
+        diffutils findutils perl python3 tar xz which vim-common \
     && nasm -v \
     && dnf clean all
 DOCKERFILE

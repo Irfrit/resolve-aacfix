@@ -207,7 +207,8 @@ run_patch() {
 # --- apply --------------------------------------------------------------
 
 apply_binary() {
-    local R="$1" bin="$R/$BIN_REL" bak="$R/$BIN_BAK" src shafile
+    local R="$1"
+    local bin="$R/$BIN_REL" bak="$R/$BIN_BAK" src shafile
     local made_backup=0
     shafile="$(bak_sha_file "$R")"
 
@@ -274,7 +275,8 @@ apply_binary() {
 
 
 apply_libs() {
-    local R="$1" libs="$R/libs" bak="$R/$LIB_BAK" l cur
+    local R="$1"
+    local libs="$R/libs" bak="$R/$LIB_BAK" l cur
     [ "$KEEP" = keep ] && mkdir -p "$bak"
     for l in "${FFMPEG_LIBS[@]}"; do
         cur="$libs/$l"

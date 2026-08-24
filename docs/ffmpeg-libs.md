@@ -121,7 +121,11 @@ Building on a glibc 2.39 host, the result tops out at `fcntl64@GLIBC_2.28` and
 `glob64@GLIBC_2.27` — the Rocky 8 baseline exactly.
 
 The first container build creates a small derived image with the build
-dependencies baked in (`resolve-aacfix-builder:el8`); later builds reuse it.
+dependencies baked in (`resolve-aacfix-builder:el8`); later builds reuse it, and
+the e9patch build uses the same image. It installs `which` and `xxd` explicitly:
+neither is in the `rockylinux:8` base image, and e9patch's `build.sh` probes for
+its tools with `which`, so without it the build fails claiming gcc is missing
+when gcc is installed and working.
 `nasm` is pulled from the PowerTools/CRB repo — without it FFmpeg quietly
 configures `--disable-x86asm` and produces a much slower library that no longer
 matches what Blackmagic shipped, so the image build asserts `nasm -v` succeeds.

@@ -63,16 +63,10 @@ jobs:
 
   # --------------------------------------------------------------- e9patch
   e9patch:
+    # Same as the ffmpeg job: dev-setup.sh containerises the build itself, so
+    # there is no job-level container and no duplicated package list here.
     runs-on: ubuntu-latest
-    container: rockylinux:8
     steps:
-      # e9patch is C++11 and vendors Zydis and libdw, so Rocky 8's stock gcc 8.5
-      # builds it unmodified.  Using a newer toolset would link against a newer
-      # libstdc++ and defeat the point of the container.
-      - name: install build deps
-        run: |
-          dnf -y -q install git gcc gcc-c++ make zlib-devel vim-common \
-                            findutils diffutils python3 tar
       - uses: actions/checkout@v4
 
       # Builds e9patch/e9tool AND compiles src/trampoline/aacadd.c against them,

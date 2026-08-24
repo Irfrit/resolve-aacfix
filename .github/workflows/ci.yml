@@ -67,18 +67,15 @@ jobs:
   # it is the fast half (~2 min), and it is the half most likely to break when
   # the pinned commit or the container image changes.
   toolchain:
+    # No job-level `container:` -- dev-setup.sh puts the build inside a glibc
+    # 2.28 image itself, so this runs the same code path a developer runs
+    # locally.  One definition of the build environment, not two that drift.
     runs-on: ubuntu-latest
-    container: rockylinux:8
     steps:
-      # e9patch is C++11 and vendors Zydis and libdw, so Rocky 8's stock
-      # gcc 8.5 builds it as-is.  Deliberately NOT a newer toolset: linking
-      # against a newer libstdc++ would defeat the whole point of the container.
-      - name: install build deps
-        run: |
-          dnf -y -q install git gcc gcc-c++ make zlib-devel vim-common \
-                            findutils diffutils python3
       - uses: actions/checkout@v4
 
+      # Builds e9patch/e9tool and compiles the trampoline against them, then
+      # checks the glibc and libstdc++ floors of the result.
       - name: build e9patch + trampoline
         run: ./scripts/dev-setup.sh e9patch
 

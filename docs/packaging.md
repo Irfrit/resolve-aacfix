@@ -158,13 +158,15 @@ The FFmpeg libraries come out targeting glibc 2.28 wherever you build them —
 `scripts/dev-setup.sh ffmpeg` produces shippable libraries locally. See
 [`ffmpeg-libs.md`](ffmpeg-libs.md#targeting-glibc-228).
 
-**e9patch is not containerised**, so a locally-built `vendor/e9tool` carries the
-host's glibc requirement and `make-release.sh` will reject it on a modern distro.
-That is correct rather than convenient: releases come from
-`.github/workflows/release.yml`, whose e9patch job runs in `rockylinux:8`. Tag
-`v*` to trigger one. `--allow-newer-glibc` skips that check so you can iterate on
-packaging locally; it prints a loud warning and the result must never be handed
-to anyone.
+e9patch and the trampoline go through the same container, so
+`scripts/dev-setup.sh` on a modern distro produces a fully shippable payload and
+`make-release.sh` passes without any escape hatch. CI runs the identical code
+path — its jobs have no `container:` of their own and no package list to drift.
+Tag `v*` to trigger a release.
+
+`--allow-newer-glibc` skips the floor check if you deliberately built natively
+with `AAC_NO_CONTAINER=1` / `FFMPEG_NO_CONTAINER=1`; it prints a loud warning and
+the result must never be handed to anyone.
 
 ## Requirements
 
@@ -174,8 +176,9 @@ capstone, pyelftools, e9patch and the FFmpeg libraries are all bundled.
 **To run from a git checkout:** additionally `capstone` and `pyelftools`, or run
 `scripts/dev-setup.sh pylibs` to vendor them.
 
-**To build:** `git`, and `docker` or `podman` for the FFmpeg build (its
-toolchain lives in the container image). Building e9patch and the trampoline
-additionally needs host `gcc`/`g++`, `make`, `zlib` headers and `xxd`.
+**To build:** `git`, and `docker` or `podman`. The whole toolchain — gcc, nasm,
+`xxd`, zlib headers — lives in the container image, so nothing but those two is
+needed on the host. On a host that is already glibc ≤ 2.28 no container is used
+and the host toolchain is needed instead.
 
 **For `build-deb`:** `fakeroot`, `dpkg-deb`, `tar`, `curl`.

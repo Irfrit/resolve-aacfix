@@ -73,6 +73,35 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $
 sha()    { sha256sum "$1" | cut -d' ' -f1; }
 sha_eq() { [ -e "$1" ] && [ -e "$2" ] && [ "$(sha "$1")" = "$(sha "$2")" ]; }
 
+# Does this libavcodec actually provide an AAC decoder?
+#
+# NOT "is it byte-identical to the copy we ship" -- that reports any other
+# AAC-enabled build, including one from an earlier release of this tool, as
+# though AAC were missing.  Ask the library instead.
+lib_has_aac() {
+    local lib="$1" rc=2
+    if command -v python3 >/dev/null 2>&1; then
+        # Definitive, and needs only ctypes from the stdlib -- not the
+        # capstone/pyelftools the patcher itself requires.
+        python3 -c '
+import ctypes, os, sys
+try:
+    c = ctypes.CDLL(os.path.abspath(sys.argv[1]))
+    c.avcodec_find_decoder.restype = ctypes.c_void_p
+    sys.exit(0 if c.avcodec_find_decoder(0x15002) else 1)   # AV_CODEC_ID_AAC
+except OSError:
+    sys.exit(2)                                             # could not load
+' "$lib" 2>/dev/null
+        rc=$?
+        case "$rc" in 0) return 0 ;; 1) return 1 ;; esac
+    fi
+    # Fallback when the library will not load here (wrong glibc, missing deps).
+    # Blackmagic strip AAC at configure time, and every FFmpeg library embeds
+    # its configure line -- so their build is identifiable by its own flag.
+    grep -qa -- "--disable-decoder='aac" "$lib" && return 1
+    return 0
+}
+
 # e9patch appends an extra LOAD segment; stock Resolve has exactly 4.  This is
 # the authoritative signal: an earlier version also grepped for a marker string,
 # but that only ever worked because of a stale prebuilt trampoline and silently
@@ -361,7 +390,7 @@ cmd_revert() {
 # --- status -------------------------------------------------------------
 
 cmd_status() {
-    local R="$1" bin l cur n_aac=0
+    local R="$1" bin l cur n_aac=0 n_ours=0
     check_root "$R"
     bin="$R/$BIN_REL"
     info "AAC-fix status for $R"
@@ -369,11 +398,36 @@ cmd_status() {
     [ -f "$R/$BIN_BAK" ] && msg "         original kept ($BIN_BAK)"
     for l in "${FFMPEG_LIBS[@]}"; do
         cur="$R/libs/$l"
-        if   [ ! -e "$cur" ];                 then msg "lib:     $l  MISSING"
-        elif sha_eq "$cur" "$LIBS_SRC/$l";    then msg "lib:     $l  AAC-enabled"; n_aac=$((n_aac+1))
-        else msg "lib:     $l  original (no AAC)"; fi
+        if [ ! -e "$cur" ]; then msg "lib:     $l  MISSING"; continue; fi
+        # Only libavcodec carries the decoder; the other three are replaced as a
+        # set because they must match it, so judge the set by that one.
+        case "$l" in
+            libavcodec.*)
+                if lib_has_aac "$cur"; then
+                    if sha_eq "$cur" "$LIBS_SRC/$l"; then
+                        msg "lib:     $l  AAC-enabled (this build)"; n_ours=$((n_ours+1))
+                    else
+                        msg "lib:     $l  AAC-enabled (a different build)"
+                    fi
+                    n_aac=$((n_aac+1))
+                else
+                    msg "lib:     $l  no AAC (Blackmagic's build)"
+                fi ;;
+            *)
+                if sha_eq "$cur" "$LIBS_SRC/$l"; then
+                    msg "lib:     $l  installed (this build)"; n_ours=$((n_ours+1))
+                else msg "lib:     $l  present"; fi
+                n_aac=$((n_aac+1)) ;;
+        esac
     done
     [ -d "$R/$LIB_BAK" ] && msg "         library originals kept ($LIB_BAK/)"
+    # Our libavcodec does not export the three AVS3 helpers Blackmagic's does,
+    # so it is not a drop-in for theirs on its own -- the four must match each
+    # other.  A half-swapped set loads until something touches AV3A.
+    if [ "$n_ours" -gt 0 ] && [ "$n_ours" -lt "${#FFMPEG_LIBS[@]}" ]; then
+        warn "mixed library set: $n_ours of ${#FFMPEG_LIBS[@]} are this build's.
+       These four must be installed together -- re-run apply."
+    fi
     if is_patched "$bin" && [ "$n_aac" -eq "${#FFMPEG_LIBS[@]}" ]; then
         info "AAC support: ACTIVE"
     elif is_patched "$bin"; then

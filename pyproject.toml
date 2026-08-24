@@ -1,0 +1,22 @@
+# Tooling config only -- this project is not a pip package.  aacpatch is
+# imported via PYTHONPATH (the installer sets it), which keeps a release tarball
+# runnable with nothing but a python3 interpreter.
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["vendor", "_ffmpeg", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = [
+    "E741",  # ambiguous name 'l' -- used deliberately in short loop bodies
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The scanners add the repo root to sys.path before importing aacpatch, so the
+# imports genuinely cannot come first.
+"tools/scan/*.py" = ["E402"]
+"tools/cov-diff.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

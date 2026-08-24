@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#
+# Launch Resolve with the FFmpeg API tracer preloaded.
+#
+#   tools/run-resolve-trace [resolve args...]
+#
+# Import a clip, quit, then read $AVTRACE_LOG.  This is the fastest triage for
+# "does format X work?": if the log shows
+#
+#   find_decoder(id=86018 aac) -> aac
+#   open2(aac ch=2 sr=48000 extradata=4) -> 0
+#
+# then the file reached FFmpeg and any remaining problem is downstream.  If
+# there is NO find_decoder line for the file at all, Resolve's own dispatch
+# dropped it before codec selection -- a gate to find, of the same shape as
+# gate1.  That single distinction is what scoped the MKV and .ts work.
+#
+# Build the shim first:  make -C tools trace.so
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+RESOLVE="${RESOLVE_BIN:-/opt/resolve/bin/resolve}"
+[ -f "$HERE/trace.so" ] || { echo "build it first: make -C $HERE trace.so" >&2; exit 1; }
+export AVTRACE_LOG="${AVTRACE_LOG:-/tmp/avtrace.log}"
+: > "$AVTRACE_LOG"
+echo "tracing to $AVTRACE_LOG"
+exec env LD_PRELOAD="$HERE/trace.so" "$RESOLVE" "$@"

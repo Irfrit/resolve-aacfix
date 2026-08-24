@@ -1,0 +1,90 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=warning \
+            aac-fix aac-patch-tree \
+            scripts/*.sh \
+            tools/make-testdata.sh tools/cov-run \
+            tools/run-resolve-gdb tools/run-resolve-trace \
+            src/ffmpeg/build-ffmpeg.sh
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: python lint
+        run: |
+          pip install --quiet ruff
+          ruff check aacpatch tools scripts tests
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      # The vendored pylibs are what a release ships, so test against them
+      # rather than against whatever pip happens to install.
+      - name: vendor python deps
+        run: ./scripts/dev-setup.sh pylibs
+
+      - name: pytest
+        run: |
+          pip install --quiet pytest
+          PYTHONPATH=.:vendor/pylibs python -m pytest tests/ -v
+
+      # Cheap end-to-end proof that the tool refuses on anything that is not a
+      # Resolve build, and that the refusal leaves nothing behind.
+      - name: refuses to patch a non-Resolve binary
+        run: |
+          set +e
+          PYTHONPATH=.:vendor/pylibs python -m aacpatch.additive \
+            /bin/bash -o /tmp/should-not-exist > /tmp/out.txt 2>&1
+          rc=$?
+          set -e
+          cat /tmp/out.txt
+          test $rc -eq 1
+          grep -q 'cannot locate a patch site' /tmp/out.txt
+          test ! -e /tmp/should-not-exist
+
+  # The real compatibility guarantee: everything we ship must load on the
+  # oldest platform Resolve itself supports.  Proving that needs the same
+  # old-glibc container the release uses, so build e9patch here on every push --
+  # it is the fast half (~2 min), and it is the half most likely to break when
+  # the pinned commit or the container image changes.
+  toolchain:
+    runs-on: ubuntu-latest
+    container: rockylinux:8
+    steps:
+      # e9patch is C++11 and vendors Zydis and libdw, so Rocky 8's stock
+      # gcc 8.5 builds it as-is.  Deliberately NOT a newer toolset: linking
+      # against a newer libstdc++ would defeat the whole point of the container.
+      - name: install build deps
+        run: |
+          dnf -y -q install git gcc gcc-c++ make zlib-devel vim-common \
+                            findutils diffutils python3
+      - uses: actions/checkout@v4
+
+      - name: build e9patch + trampoline
+        run: ./scripts/dev-setup.sh e9patch
+
+      - name: verify glibc floor and trampoline exports
+        run: |
+          . scripts/versions.sh
+          ./scripts/check-elf-compat.sh "$MAX_GLIBC" \
+            vendor/e9patch/e9patch vendor/e9patch/e9tool
+          ./scripts/check-trampoline.sh vendor/aacadd

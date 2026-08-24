@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+#
+# One half of the differential-coverage workflow (see cov-diff.py for the other).
+#
+#   tools/cov-run ac3        # import ONE clip whose codec works, then quit
+#   tools/cov-run aac        # import ONE clip that fails, then quit
+#   tools/cov-diff.py -b <unpatched-binary> /tmp/cov_ac3.bin /tmp/cov_aac.bin
+#
+# Requires a Resolve binary instrumented with tools/cov.c -- e.g.
+#   vendor/e9patch/e9tool -M 'jmp or call' -P 'before mark(addr)@vendor/cov' \
+#       resolve -o resolve.cov
+#
+# Import exactly one clip per run: every extra interaction adds blocks to both
+# bitmaps and dilutes the diff.
+set -euo pipefail
+LABEL="${1:?usage: cov-run <label>   (e.g. ac3, aac)}"
+RESOLVE="${RESOLVE_BIN:-/opt/resolve/bin/resolve}"
+rm -f /tmp/cov.bin
+echo "import the ONE test clip for '$LABEL', let it settle, then QUIT Resolve."
+"$RESOLVE"
+sync
+cp /tmp/cov.bin "/tmp/cov_${LABEL}.bin" && echo "saved /tmp/cov_${LABEL}.bin"

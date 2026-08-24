@@ -1,0 +1,26 @@
+# Built payload -- produced by scripts/dev-setup.sh, shipped in release tarballs.
+/vendor/
+/prebuilt/
+
+# Build scratch
+/_ffmpeg/
+/dist/
+/testdata/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.whl
+*.so
+*.o
+
+# Tool build outputs
+/tools/cov
+/tools/mkvprobe
+
+# Never commit these: they are Blackmagic's, and enormous.
+resolve
+resolve.orig
+*.aac-orig
+*.run
+*.deb

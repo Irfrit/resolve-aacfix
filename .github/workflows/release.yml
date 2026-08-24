@@ -1,0 +1,203 @@
+name: release
+
+# Builds the self-contained release tarball.  Everything that ends up in it is
+# compiled here, inside a Rocky Linux 8 container, because that is glibc 2.28 --
+# the oldest platform Blackmagic support for Resolve 21, and therefore the floor
+# anything we install next to Resolve has to meet.  Building on the ubuntu-latest
+# runner instead would produce libraries requiring GLIBC_2.35 that simply fail to
+# load on a machine where Resolve itself runs fine.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string for the artifact name (default: git describe)'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------- FFmpeg
+  ffmpeg:
+    runs-on: ubuntu-latest
+    container: rockylinux:8
+    steps:
+      - name: install build deps
+        run: |
+          dnf -y -q install git make gcc gcc-c++ nasm zlib-devel \
+                            diffutils findutils perl python3 tar xz
+      - uses: actions/checkout@v4
+
+      - name: read pins
+        id: pins
+        run: |
+          . scripts/versions.sh
+          echo "ffmpeg_tag=$FFMPEG_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: cache FFmpeg source
+        uses: actions/cache@v4
+        with:
+          path: _ffmpeg/src
+          key: ffmpeg-src-${{ steps.pins.outputs.ffmpeg_tag }}
+
+      - name: build
+        run: ./scripts/dev-setup.sh ffmpeg
+
+      # dev-setup already runs check-ffmpeg-libs.sh, but re-run it standalone so
+      # a failure here is unambiguous in the log.  These assertions are the
+      # whole reason to build in CI: sonames matching Blackmagic's, $ORIGIN
+      # RUNPATH, AAC present, AC-3 encoder still absent, AV3A backport applied,
+      # LGPL-only, and the glibc floor.
+      - name: verify
+        run: ./scripts/check-ffmpeg-libs.sh prebuilt/ffmpeg-aac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-aac
+          path: prebuilt/ffmpeg-aac/
+          retention-days: 7
+
+  # --------------------------------------------------------------- e9patch
+  e9patch:
+    runs-on: ubuntu-latest
+    container: rockylinux:8
+    steps:
+      # e9patch is C++11 and vendors Zydis and libdw, so Rocky 8's stock gcc 8.5
+      # builds it unmodified.  Using a newer toolset would link against a newer
+      # libstdc++ and defeat the point of the container.
+      - name: install build deps
+        run: |
+          dnf -y -q install git gcc gcc-c++ make zlib-devel vim-common \
+                            findutils diffutils python3 tar
+      - uses: actions/checkout@v4
+
+      # Builds e9patch/e9tool AND compiles src/trampoline/aacadd.c against them,
+      # so the shipped trampoline is always the one this repo's source produces.
+      - name: build e9patch + trampoline
+        run: ./scripts/dev-setup.sh e9patch
+
+      - name: verify
+        run: |
+          . scripts/versions.sh
+          ./scripts/check-elf-compat.sh "$MAX_GLIBC" \
+            vendor/e9patch/e9patch vendor/e9patch/e9tool
+          ./scripts/check-trampoline.sh vendor/aacadd
+
+      - name: stage
+        run: |
+          mkdir -p out/e9patch
+          cp vendor/e9patch/e9patch vendor/e9patch/e9tool \
+             vendor/e9patch/LICENSE out/e9patch/
+          cp vendor/aacadd out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e9patch
+          path: out/
+          retention-days: 7
+
+  # ---------------------------------------------------------------- python
+  pylibs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      # manylinux2014 wheels == glibc 2.17, well under the floor.  Vendoring
+      # these is what lets a release tarball run with nothing but python3.
+      - name: vendor capstone + pyelftools
+        run: ./scripts/dev-setup.sh pylibs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pylibs
+          path: vendor/pylibs/
+          retention-days: 7
+
+  # --------------------------------------------------------------- package
+  package:
+    needs: [ffmpeg, e9patch, pylibs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }      # so `git describe` sees the tag
+
+      - uses: actions/download-artifact@v4
+        with: { name: ffmpeg-aac, path: prebuilt/ffmpeg-aac }
+      - uses: actions/download-artifact@v4
+        with: { name: e9patch, path: vendor }
+      - uses: actions/download-artifact@v4
+        with: { name: pylibs, path: vendor/pylibs }
+
+      - name: restore exec bits
+        run: |
+          chmod +x vendor/e9patch/e9patch vendor/e9patch/e9tool
+          chmod +x aac-fix aac-patch-tree scripts/*.sh tools/cov-run \
+                   tools/run-resolve-gdb tools/run-resolve-trace \
+                   tools/make-testdata.sh src/ffmpeg/build-ffmpeg.sh
+
+      - name: build tarball
+        run: |
+          VER="${{ github.event.inputs.version }}"
+          [ -n "$VER" ] || VER="$(git describe --tags --always)"
+          ./scripts/make-release.sh -o dist "$VER"
+
+      # Prove the "download and run" path end to end: unpack the tarball
+      # somewhere else, with no PYTHONPATH and no pip installs, and confirm the
+      # tool starts, finds its vendored dependencies and its payload, verifies
+      # the SHA256SUMS manifest, and then refuses cleanly because the target is
+      # not a Resolve tree.
+      - name: smoke-test the tarball
+        run: |
+          mkdir -p /tmp/smoke && tar -xzf dist/*.tar.gz -C /tmp/smoke
+          pkg="$(echo /tmp/smoke/resolve-aacfix-*)"
+          ( cd "$pkg" && sha256sum --quiet -c SHA256SUMS )
+          mkdir -p /tmp/fake/bin /tmp/fake/libs && cp /bin/bash /tmp/fake/bin/resolve
+          out="$("$pkg/aac-patch-tree" status /tmp/fake 2>&1)" || true
+          echo "$out"
+          echo "$out" | grep -q 'binary:  original'
+          set +e
+          "$pkg/aac-patch-tree" apply /tmp/fake > /tmp/apply.log 2>&1
+          rc=$?
+          set -e
+          cat /tmp/apply.log
+          test $rc -ne 0
+          grep -q 'cannot locate a patch site' /tmp/apply.log
+          test ! -e /tmp/fake/bin/resolve.aac-tmp
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-tarball
+          path: dist/
+
+      - name: publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          generate_release_notes: true
+          body: |
+            Self-contained AAC fix for DaVinci Resolve Studio 21.x on Linux.
+
+            ```sh
+            tar -xzf resolve-aacfix-*.tar.gz
+            cd resolve-aacfix-*
+            sudo ./aac-fix install          # patches /opt/resolve
+            ./aac-fix status
+            sudo ./aac-fix uninstall        # restores the originals
+            ```
+
+            Needs only `python3` and `binutils` — capstone, pyelftools, e9patch
+            and the AAC-enabled FFmpeg libraries are all bundled. Everything is
+            built here in a Rocky Linux 8 container (glibc 2.28), so it loads on
+            any platform Resolve 21 itself supports.
+
+            **Close Resolve before installing.** See the README for the caveats,
+            in particular: Studio only, tested on Resolve 21, `.mkv` needs a
+            video track, and raw `.aac`/`.ts`/`.flv` are not supported.
+
+            Third-party components and their licenses: `THIRD-PARTY.md`.

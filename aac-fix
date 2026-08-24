@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+#
+# aac-fix -- restore AAC audio support in DaVinci Resolve Studio 21.x on Linux.
+#
+# A thin wrapper around `aac-patch-tree`, which does the actual patching of a
+# Resolve tree.  This script only handles the two ways you'd want to drive it:
+#
+#   against a live install ....... install / uninstall / status
+#   against an installer ......... build-deb (wraps makeresolvedeb)
+#
+# Usage:
+#   aac-fix install   [RESOLVE_ROOT]        patch an install (default /opt/resolve)
+#   aac-fix uninstall [RESOLVE_ROOT]        restore the originals kept at install
+#   aac-fix status    [RESOLVE_ROOT]        report what's applied
+#   aac-fix build-deb INSTALLER.run [MRD.sh]
+#                                           build a patched .deb from the .run
+#                                           (makeresolvedeb auto-downloaded and
+#                                            checksum-verified if not supplied)
+#
+# Anything more exotic -- patching an unpacked tree somewhere, keeping or
+# dropping the originals -- is `aac-patch-tree` directly.
+#
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+PKG="$(cd "$(dirname "$SELF")" && pwd)"
+CORE="$PKG/aac-patch-tree"
+
+DEFAULT_ROOT=/opt/resolve
+
+# pinned makeresolvedeb (verified against this sha256 after download)
+MRD_URL="https://www.danieltufvesson.com/download/?file=makeresolvedeb/makeresolvedeb_1.10.0_multi.sh.tar.gz"
+MRD_SHA256="dd7518f4a847bd39957591674955a59027996343406893b46a4178b8ce1233cf"
+MRD_TGZ_SHA256="784baa93471dae0c61a6c629dc94516b561fef884b7e31ece399dc85ad31e8e0"
+
+msg()  { printf '  %s\n' "$*"; }
+info() { printf '\033[1m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m[warn]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+[ -x "$CORE" ] || die "core patcher not found/executable: $CORE"
+
+# re-exec under sudo when the target tree isn't writable by us
+ensure_writable() {
+    local R="$1"
+    [ -w "$R/bin/resolve" ] && [ -w "$R/libs" ] && return 0
+
+    # Already root and still not writable?  sudo cannot help (read-only mount,
+    # immutable flag, missing file).  Without this check the old code re-exec'd
+    # forever: the test is also true for a NONEXISTENT path, and stays true as
+    # root, so a typo'd root spawned an unbounded sudo loop.
+    if [ "$(id -u)" -eq 0 ]; then
+        [ -f "$R/bin/resolve" ] || die "no Resolve binary at $R/bin/resolve"
+        die "cannot write to $R even as root (read-only mount or immutable file?)"
+    fi
+    [ -n "${AAC_FIX_REEXEC:-}" ] && die "sudo re-exec did not gain write access to $R"
+    [ -f "$R/bin/resolve" ] || die "no Resolve binary at $R/bin/resolve -- is this a Resolve root?"
+
+    info "need root to modify $R -- re-running with sudo"
+    # Deliberately NOT `sudo -E`: AAC_E9TOOL / AAC_TRAMPOLINE / AAC_LIBS select
+    # an executable and the payload copied into /opt, and they are not on sudo's
+    # blocklist.  Preserving them meant that anyone able to run this via a
+    # NOPASSWD sudoers rule could point them at their own binary and get root.
+    # The toolchain is resolved from the package directory instead.
+    exec sudo AAC_FIX_REEXEC=1 "$SELF" "${ORIG_ARGS[@]}"
+}
+
+# Patching swaps the binary and the libraries under a running process: the
+# rename keeps the old inode alive, but a later lazy dlopen picks up a library
+# that no longer matches the running image.  Refuse rather than warn.
+refuse_if_running() {
+    local pids
+    pids="$(pgrep -x resolve 2>/dev/null || true)"
+    [ -z "$pids" ] || die "DaVinci Resolve is running (pid: $(echo $pids | tr '\n' ' '))
+       Close it first -- patching underneath a live process gives it a
+       mismatched mix of old and new libraries.
+       Override with AAC_ALLOW_RUNNING=1 if you know what you are doing."
+}
+
+cmd_install() {
+    local R="${1:-$DEFAULT_ROOT}"
+    [ -d "$R" ] || die "Resolve root not found: $R"
+    [ -n "${AAC_ALLOW_RUNNING:-}" ] || refuse_if_running
+    ensure_writable "$R"
+    "$CORE" apply --originals keep "$R"
+    info "Restart Resolve; AAC audio should now decode."
+}
+
+cmd_uninstall() {
+    local R="${1:-$DEFAULT_ROOT}"
+    [ -d "$R" ] || die "Resolve root not found: $R"
+    [ -n "${AAC_ALLOW_RUNNING:-}" ] || refuse_if_running
+    ensure_writable "$R"
+    "$CORE" revert "$R"
+}
+
+cmd_status() {
+    "$CORE" status "${1:-$DEFAULT_ROOT}"
+}
+
+# download + verify makeresolvedeb; echo its path on stdout
+fetch_mrd() {
+    local dst="$1" tgz="$1/mrd.tar.gz" sh got
+    need_cmd curl; need_cmd tar
+    info "Downloading makeresolvedeb (pinned 1.10.0)" >&2
+    curl -fsSL "$MRD_URL" -o "$tgz" || die "download failed: $MRD_URL"
+    # Verify the ARCHIVE before unpacking it.  Extracting first and checksumming
+    # the result afterwards hands a compromised server tar-extraction primitives
+    # (symlink/hardlink members) before the pin is ever consulted.
+    got="$(sha256sum "$tgz" | cut -d' ' -f1)"
+    [ "$got" = "$MRD_TGZ_SHA256" ] || die "makeresolvedeb archive checksum mismatch!
+  expected $MRD_TGZ_SHA256
+  got      $got
+  refusing to unpack an unverified archive"
+    tar -xzf "$tgz" -C "$dst" --no-same-owner --no-same-permissions \
+        || die "failed to extract makeresolvedeb archive"
+    sh="$(find "$dst" -name 'makeresolvedeb_*_multi.sh' -type f)"
+    [ "$(printf '%s\n' "$sh" | grep -c .)" = 1 ] || \
+        die "expected exactly one makeresolvedeb_*_multi.sh in the archive"
+    got="$(sha256sum "$sh" | cut -d' ' -f1)"
+    [ "$got" = "$MRD_SHA256" ] || die "makeresolvedeb checksum mismatch!
+  expected $MRD_SHA256
+  got      $got
+  refusing to run an unverified script"
+    msg "verified makeresolvedeb sha256" >&2
+    printf '%s' "$sh"
+}
+
+cmd_build_deb() {
+    local installer="${1:-}" mrd="${2:-}"
+    [ -n "$installer" ] || die "usage: aac-fix build-deb INSTALLER.run [MRD.sh]"
+    [ -f "$installer" ] || die "installer not found: $installer"
+    need_cmd fakeroot; need_cmd dpkg-deb; need_cmd tar
+    installer="$(readlink -f "$installer")"
+    [ -n "$mrd" ] && { [ -f "$mrd" ] || die "makeresolvedeb not found: $mrd"; \
+                       mrd="$(readlink -f "$mrd")"; }
+    local outdir; outdir="$(pwd)"
+
+    # NB: global, not local -- the EXIT trap fires after this function returns,
+    # when a local would already be out of scope (and `set -u` would abort the
+    # cleanup, leaking tens of GB of staging).
+    BUILD_TMP="$(mktemp -d "${TMPDIR:-/tmp}/aac-deb.XXXXXX")"
+    trap 'chmod -R u+w "${BUILD_TMP:-}" 2>/dev/null; rm -rf "${BUILD_TMP:-}"' EXIT
+    local build="$BUILD_TMP"
+
+    # makeresolvedeb insists the .run sits in its CWD, referenced by basename
+    local run; run="$(basename "$installer")"
+    ln -s "$installer" "$build/$run"
+    [ -n "$mrd" ] || mrd="$(fetch_mrd "$build")"
+
+    info "Staging with makeresolvedeb (CI_TEST=1: extract + stage, skip packaging)"
+    # MAINTAINER: makeresolvedeb defaults to "$(whoami)@$(hostname)", which bakes
+    # the builder's username and machine name into every package it produces.
+    ( cd "$build" && CI_TEST=1 MAINTAINER="${MAINTAINER:-aac-fix <nobody@localhost>}" \
+        bash "$mrd" "$run" )
+
+    local deb_dir deb_data n
+    # `| head -1` would silently pick one of several staged dirs (and can trip
+    # SIGPIPE under `set -o pipefail`); be explicit about ambiguity instead.
+    deb_dir="$(find "$build" -maxdepth 1 -type d -name 'davinci-resolve*_amd64' ! -name '*-data_*')"
+    deb_data="$(find "$build" -maxdepth 1 -type d -name 'davinci-resolve*-data_*_amd64')"
+    n="$(printf '%s\n' "$deb_dir" | grep -c . || true)"
+    [ "$n" = 1 ] || die "expected exactly one staged package dir, found $n"
+    n="$(printf '%s\n' "$deb_data" | grep -c . || true)"
+    [ "$n" -le 1 ] || die "expected at most one staged -data dir, found $n"
+
+    # --originals remove: rollback copies inside a .deb would add ~670MB of dead
+    # weight (a second copy of the 653MB binary); you revert by reinstalling the
+    # stock package instead.
+    "$CORE" apply --originals remove "$deb_dir/opt/resolve"
+
+    # mark the package: version suffix + description note (idempotent)
+    local ctrl="$deb_dir/DEBIAN/control"
+    if ! grep -q '^Version:.*+aac' "$ctrl"; then
+        sed -i -E 's/^(Version: .*)$/\1+aac1/'                    "$ctrl"
+        sed -i -E 's/^(Description: .*)$/\1 (with AAC decode fix)/' "$ctrl"
+    fi
+
+    info "Building .deb package(s) -- this takes a while, do not interrupt"
+    fakeroot dpkg-deb -b "$deb_dir" "$outdir/$(basename "$deb_dir")+aac.deb"
+    [ -n "$deb_data" ] && fakeroot dpkg-deb -b "$deb_data" "$outdir/$(basename "$deb_data").deb"
+    info "Wrote:"
+    ls -1sh "$outdir/$(basename "$deb_dir")+aac.deb" \
+            ${deb_data:+"$outdir/$(basename "$deb_data").deb"} | sed 's/^/  /'
+}
+
+usage() {
+    # print the header comment block (from line 3) and stop at the first
+    # non-comment line, so the help can never spill into the code
+    awk 'NR>=3 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$SELF"
+    exit "${1:-0}"
+}
+
+main() {
+    ORIG_ARGS=("$@")
+    local cmd="${1:-}"; shift || true
+    case "$cmd" in
+        install)   cmd_install   "$@" ;;
+        uninstall) cmd_uninstall "$@" ;;
+        status)    cmd_status    "$@" ;;
+        build-deb) cmd_build_deb "$@" ;;
+        -h|--help|help|"") usage 0 ;;
+        *) die "unknown subcommand: $cmd (try --help)" ;;
+    esac
+}
+main "$@"

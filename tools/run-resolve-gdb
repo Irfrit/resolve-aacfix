@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+#
+# Launch Resolve under gdb with the tracer preloaded, running a breakpoint
+# script that logs to /tmp/gdb-resolve.log while Resolve stays interactive.
+#
+#   tools/run-resolve-gdb [gdb-script]      (default: gdb/ctor-bt.gdb)
+#
+# Resolve must run as gdb's CHILD: with the usual ptrace_scope=1 you cannot
+# attach to an already-running Resolve, and Resolve re-execs itself in ways that
+# make attaching unreliable anyway.
+#
+# The workflow that actually finds things: import a clip whose codec WORKS, then
+# one that fails, and diff the backtraces.  That is how the Matroska path was
+# shown to never call F (the per-track decoder function) for AAC at all -- which
+# in turn proved the stream was being dropped upstream of the dispatch we had
+# been patching.
+#
+# NOTE: every address in gdb/*.gdb is pinned to Resolve Studio 21.0.3/21.0.4.
+# On any other build, re-derive them first:
+#     python -m aacpatch.locate /opt/resolve/bin/resolve
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+RESOLVE="${RESOLVE_BIN:-/opt/resolve/bin/resolve}"
+SCRIPT="${1:-$HERE/gdb/ctor-bt.gdb}"
+[ -f "$SCRIPT" ] || { echo "no such gdb script: $SCRIPT" >&2; exit 1; }
+export AVTRACE_LOG="${AVTRACE_LOG:-/tmp/avtrace.log}"; : > "$AVTRACE_LOG"
+: > /tmp/gdb-resolve.log
+if [ -f "$HERE/trace.so" ]; then
+    export LD_PRELOAD="$HERE/trace.so"
+else
+    echo "(no trace.so; running without the FFmpeg tracer -- make -C $HERE trace.so)" >&2
+fi
+echo "gdb script: $SCRIPT   log: /tmp/gdb-resolve.log"
+echo "(import clips in Resolve; quit Resolve to finish)"
+exec gdb -nx -q -x "$SCRIPT" "$RESOLVE"

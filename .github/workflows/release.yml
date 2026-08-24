@@ -165,7 +165,10 @@ jobs:
           cat /tmp/apply.log
           test $rc -ne 0
           grep -q 'cannot locate a patch site' /tmp/apply.log
+          # A refusal must leave the tree exactly as it was found -- no partial
+          # output, and no 653MB backup stranded from the run that failed.
           test ! -e /tmp/fake/bin/resolve.aac-tmp
+          test ! -e /tmp/fake/bin/resolve.aac-orig
 
       - uses: actions/upload-artifact@v4
         with:

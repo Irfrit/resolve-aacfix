@@ -15,4 +15,11 @@ Both are explained in full in
 scripts/dev-setup.sh ffmpeg     # clone n6.0.1, apply the patch, build, verify
 ```
 
-The script refuses to start if the AV3A patch is not applied to the source tree.
+`build-ffmpeg.sh` targets **glibc 2.28** wherever it runs: if the host glibc is
+newer it re-runs itself inside a `rockylinux:8` container
+(`../../scripts/old-glibc-build.sh`), and either way it checks the glibc floor of
+the libraries it produced. That is what Resolve's own baseline requires — see
+[`../../docs/ffmpeg-libs.md`](../../docs/ffmpeg-libs.md#targeting-glibc-228).
+
+It refuses to start if the AV3A patch is not applied to the source tree, and
+refuses to finish if the result would not load on Rocky Linux 8.

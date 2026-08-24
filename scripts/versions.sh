@@ -21,3 +21,9 @@ FFMPEG_LIBS="libavcodec.so.60.3.100 libavformat.so.60.3.100 libavutil.so.58.2.10
 
 # The symbols the trampoline must export -- one per e9patch patch site.
 TRAMPOLINE_SYMS="redirect build5 aac_esds_fix mkv_undrop mkv_asc"
+
+# Container image providing MAX_GLIBC.  Builds run inside this whenever the host
+# glibc is newer, so a local build produces the same shippable libraries CI does.
+GLIBC_CONTAINER=rockylinux:8
+# Derived builder image (base + build deps), cached between runs.
+GLIBC_BUILDER_IMAGE=resolve-aacfix-builder:el8

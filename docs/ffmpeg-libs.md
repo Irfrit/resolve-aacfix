@@ -101,19 +101,53 @@ Blackmagic's `libavcodec` alone.** It does not export those three helpers. The
 four libraries must be installed as a set, never mixed. `aac-patch-tree` always
 installs all four together.
 
-## Why the release is built in a Rocky Linux 8 container
+## Targeting glibc 2.28
 
 Resolve's own binary references at most `GLIBC_2.27`, and Blackmagic's supported
 baseline for Resolve 21 is Rocky Linux 8 — glibc 2.28.
 
 Libraries built on a current distro reference `GLIBC_2.35`. They would install
-cleanly and then fail to load on a platform Resolve itself runs on perfectly well,
-producing a Resolve that no longer starts. So the release workflow builds inside
-`rockylinux:8`, and `scripts/check-elf-compat.sh` fails the build if anything
-references a glibc symbol newer than 2.28.
+cleanly and then fail to load on a platform Resolve itself runs on perfectly
+well, producing a Resolve that no longer starts.
 
-This is the single biggest reason these libraries are built in CI rather than
-shipped from a developer's machine.
+So **`build-ffmpeg.sh` builds against glibc 2.28 regardless of the host.** If the
+host glibc is newer, it re-runs itself inside a `rockylinux:8` container
+(`scripts/old-glibc-build.sh`), and either way it checks the glibc floor of what
+it produced and fails if it is too high. A local `scripts/dev-setup.sh ffmpeg` on
+a modern distro therefore produces genuinely shippable libraries, identical in
+this respect to a release build.
+
+Building on a glibc 2.39 host, the result tops out at `fcntl64@GLIBC_2.28` and
+`glob64@GLIBC_2.27` — the Rocky 8 baseline exactly.
+
+The first container build creates a small derived image with the build
+dependencies baked in (`resolve-aacfix-builder:el8`); later builds reuse it.
+`nasm` is pulled from the PowerTools/CRB repo — without it FFmpeg quietly
+configures `--disable-x86asm` and produces a much slower library that no longer
+matches what Blackmagic shipped, so the image build asserts `nasm -v` succeeds.
+
+`FFMPEG_NO_CONTAINER=1` builds with the host toolchain instead. That is for
+iterating locally; the glibc check at the end of the script will say so, loudly.
+
+### Why not symbol-version pinning?
+
+The usual alternative is `.symver` directives pinning `exp`, `pow`, `pthread_*`,
+`dlopen` and friends back to `GLIBC_2.2.5`. It was considered and rejected:
+
+- It only covers the symbols you thought of. It happens to fail loudly here
+  because of the floor check, but it needs maintenance every time the build
+  changes.
+- It **silently substitutes older implementations**. glibc 2.29's `exp`/`pow` and
+  2.35's `hypot` are different code from the 2.2.5 versions. That cuts directly
+  against the point of this build, which is to be Blackmagic's library with one
+  configure flag changed and nothing else.
+- It cannot express `fstat64` at all: glibc before 2.33 has no such symbol, only
+  `__fxstat64`, so that one needs a hand-written wrapper passing the right
+  `_STAT_VER` — real glibc-internals surgery in a library that decodes untrusted
+  media.
+
+Compiling against the real 2.28 headers and symbols has none of those problems
+and needs no maintenance.
 
 ## Verification
 
@@ -151,4 +185,9 @@ git -C _ffmpeg/src apply "$PWD/src/ffmpeg/patches/0001-av3a-demuxer-backport.pat
 FFMPEG_SRC=_ffmpeg/src ./src/ffmpeg/build-ffmpeg.sh
 ```
 
-The build script refuses to start if the AV3A patch is not applied.
+Needs `git` and a working `docker` or `podman` on the host; the compiler,
+`nasm` and the rest live in the container image. On a host that is already
+glibc ≤ 2.28 no container is used and the host toolchain is needed instead.
+
+The build script refuses to start if the AV3A patch is not applied, and refuses
+to finish if the libraries it produced reference too new a glibc.

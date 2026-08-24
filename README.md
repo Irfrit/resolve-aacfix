@@ -116,12 +116,15 @@ scripts/dev-setup.sh          # e9patch + trampoline, capstone/pyelftools, FFmpe
 sudo ./aac-fix install
 ```
 
-Releases are built by [`.github/workflows/release.yml`](.github/workflows/release.yml)
-inside a Rocky Linux 8 container. That is deliberate: Resolve's own binary
-references at most `GLIBC_2.27`, and Blackmagic's supported baseline for Resolve
-21 is Rocky Linux 8 (glibc 2.28). Libraries built on a current distro reference
-`GLIBC_2.35` and would fail to load on a machine where Resolve runs fine, so the
-build fails if anything references a newer glibc symbol.
+The FFmpeg build targets **glibc 2.28** whatever you build it on: Resolve's own
+binary references at most `GLIBC_2.27`, and Blackmagic's supported baseline for
+Resolve 21 is Rocky Linux 8 (glibc 2.28). Libraries built on a current distro
+reference `GLIBC_2.35` and would install fine and then fail to load on a machine
+where Resolve runs perfectly well. So `build-ffmpeg.sh` runs the compile inside a
+`rockylinux:8` container unless the host is already that old, then verifies the
+glibc floor of what it produced and fails if it is too high — locally and in CI
+alike. That needs `docker` or `podman`; see
+[`docs/ffmpeg-libs.md`](docs/ffmpeg-libs.md#targeting-glibc-228).
 
 ## Documentation
 

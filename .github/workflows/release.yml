@@ -22,13 +22,12 @@ permissions:
 jobs:
   # ---------------------------------------------------------------- FFmpeg
   ffmpeg:
+    # Deliberately NOT a job-level `container:`.  build-ffmpeg.sh puts itself
+    # inside a glibc 2.28 image, so this job runs the exact same code path a
+    # developer runs locally -- one definition of the build environment instead
+    # of two that can drift apart.
     runs-on: ubuntu-latest
-    container: rockylinux:8
     steps:
-      - name: install build deps
-        run: |
-          dnf -y -q install git make gcc gcc-c++ nasm zlib-devel \
-                            diffutils findutils perl python3 tar xz
       - uses: actions/checkout@v4
 
       - name: read pins
@@ -43,6 +42,8 @@ jobs:
           path: _ffmpeg/src
           key: ffmpeg-src-${{ steps.pins.outputs.ffmpeg_tag }}
 
+      # Builds the glibc 2.28 builder image, then FFmpeg inside it, then checks
+      # the glibc floor of what came out.  Fails the job if it is too new.
       - name: build
         run: ./scripts/dev-setup.sh ffmpeg
 

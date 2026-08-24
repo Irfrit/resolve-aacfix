@@ -95,7 +95,10 @@ do_pylibs() {
 }
 
 do_ffmpeg() {
-    need git; need gcc; need make; need nasm
+    # Only git is needed on the host: build-ffmpeg.sh runs the compile inside a
+    # glibc 2.28 container unless the host glibc is already that old, so the
+    # toolchain lives in the image rather than here.
+    need git
     local src="${FFMPEG_SRC:-$ROOT/_ffmpeg/src}"
     local prefix="${FFMPEG_PREFIX:-$ROOT/_ffmpeg/install}"
     if [ ! -d "$src/.git" ]; then

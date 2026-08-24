@@ -153,12 +153,18 @@ scripts/make-release.sh
 codec inventory, trampoline exports), writes `SHA256SUMS`, and packs the tarball.
 It refuses if anything is missing or fails a check.
 
-Note the local build will fail the glibc check on a modern distro, and that is
-correct — see [`ffmpeg-libs.md`](ffmpeg-libs.md#why-the-release-is-built-in-a-rocky-linux-8-container).
-`--allow-newer-glibc` skips that one check so you can iterate on packaging
-locally; it prints a loud warning and the result must never be handed to anyone.
-Real releases come from `.github/workflows/release.yml`, which does the same
-thing inside `rockylinux:8`. Tag `v*` to trigger one.
+The FFmpeg libraries come out targeting glibc 2.28 wherever you build them —
+`build-ffmpeg.sh` containerises itself when the host is newer, so
+`scripts/dev-setup.sh ffmpeg` produces shippable libraries locally. See
+[`ffmpeg-libs.md`](ffmpeg-libs.md#targeting-glibc-228).
+
+**e9patch is not containerised**, so a locally-built `vendor/e9tool` carries the
+host's glibc requirement and `make-release.sh` will reject it on a modern distro.
+That is correct rather than convenient: releases come from
+`.github/workflows/release.yml`, whose e9patch job runs in `rockylinux:8`. Tag
+`v*` to trigger one. `--allow-newer-glibc` skips that check so you can iterate on
+packaging locally; it prints a loud warning and the result must never be handed
+to anyone.
 
 ## Requirements
 
@@ -168,6 +174,8 @@ capstone, pyelftools, e9patch and the FFmpeg libraries are all bundled.
 **To run from a git checkout:** additionally `capstone` and `pyelftools`, or run
 `scripts/dev-setup.sh pylibs` to vendor them.
 
-**To build:** `gcc`/`g++`, `make`, `nasm`, `zlib` headers, `xxd`, `git`.
+**To build:** `git`, and `docker` or `podman` for the FFmpeg build (its
+toolchain lives in the container image). Building e9patch and the trampoline
+additionally needs host `gcc`/`g++`, `make`, `zlib` headers and `xxd`.
 
 **For `build-deb`:** `fakeroot`, `dpkg-deb`, `tar`, `curl`.

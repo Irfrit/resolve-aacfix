@@ -221,8 +221,19 @@ apply_binary() {
             msg "binary already patched; re-applying from the kept original"
             src="$bak"
         else
-            die "$bin is already patched and no pristine original is available
-       (expected $bak) -- reinstall Resolve to recover a clean binary"
+            die "$bin is already patched and no pristine original is kept
+       (expected $bak).
+
+       The patch cannot be applied on top of itself, and it cannot be undone
+       without the original: e9patch offers no unpatch, so nothing here can
+       reconstruct it.  Get a clean binary back, then apply again:
+
+         from a package      sudo apt install --reinstall davinci-resolve-studio
+         from the installer  aac-fix build-deb DaVinci_Resolve_Studio_<ver>.run
+                             (patches a fresh copy; nothing to undo)
+
+       This is the trade --originals remove makes.  Use the default
+       (--originals keep) on a live install to keep revert and re-apply working."
         fi
     else
         src="$bin"
@@ -331,7 +342,8 @@ cmd_revert() {
        $bin has been left alone; reinstall Resolve to recover."
         fi
     elif is_patched "$bin"; then
-        warn "binary is patched but no original kept ($BIN_BAK missing)"
+        warn "binary is patched but no original was kept ($BIN_BAK missing) --
+       cannot restore it.  Reinstall Resolve's package to get a stock binary."
     else
         msg "binary already original"
     fi

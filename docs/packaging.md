@@ -42,6 +42,24 @@ stock package.
 Re-running `apply` is safe either way: if the binary is already patched it
 re-patches **from the kept original**, never from the patched binary.
 
+With `--originals remove` there is no kept original, so `apply` and `revert` both
+refuse and say so. That is not a gap to be closed — **e9patch has no unpatch**,
+and nothing here can reconstruct a 653 MB binary it did not keep. The patched
+output does happen to leave the original bytes intact and append to them, but
+that is observed behaviour of a tool we do not control rather than a documented
+contract, so it is not something to build a rollback on.
+
+The workflows that mode is for do not need in-place re-patching anyway:
+
+| you have | to get back to stock | to re-patch |
+|---|---|---|
+| a live install, `--originals keep` | `aac-fix uninstall` | `aac-fix install` |
+| a live install, `--originals remove` | reinstall the package | reinstall, then `aac-fix install` |
+| a patched `.deb` | install the stock `.deb` | `aac-fix build-deb` again from the `.run` |
+
+`build-deb` always starts from a freshly-extracted installer, so it never has an
+already-patched binary to deal with.
+
 ## Safety properties worth preserving
 
 Everything below exists because the tool writes into a working Resolve install.

@@ -126,12 +126,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: pylibs, path: vendor/pylibs }
 
-      - name: restore exec bits
-        run: |
-          chmod +x vendor/e9patch/e9patch vendor/e9patch/e9tool
-          chmod +x aac-fix aac-patch-tree scripts/*.sh tools/cov-run \
-                   tools/run-resolve-gdb tools/run-resolve-trace \
-                   tools/make-testdata.sh src/ffmpeg/build-ffmpeg.sh
+      # Only the downloaded artifacts need this: upload-artifact does not
+      # preserve the executable bit.  Everything else comes from the checkout,
+      # where git already carries the right mode -- and chmod-ing tracked files
+      # here would risk dirtying the tree, which make-release.sh checks for
+      # before it uses `git archive`.
+      - name: restore exec bits on artifacts
+        run: chmod +x vendor/e9patch/e9patch vendor/e9patch/e9tool
 
       - name: build tarball
         run: |
@@ -178,6 +179,9 @@ jobs:
             dist/*.tar.gz
             dist/*.tar.gz.sha256
           generate_release_notes: true
+          # A tag with a suffix (v0.1.0-rc1) is a dry run of this pipeline and
+          # must not look like a finished release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             Self-contained AAC fix for DaVinci Resolve Studio 21.x on Linux.
 

@@ -41,10 +41,12 @@ while [ $# -gt 0 ]; do
 done
 [ $# -gt 0 ] || die "no command given (use -- COMMAND ...)"
 
-# --- container runtime
+# --- container runtime.  docker first: its bind-mount ownership semantics are
+# the straightforward ones, and rootless podman needs --userns=keep-id below to
+# behave the same way.
 RUNTIME="${CONTAINER_RUNTIME:-}"
 if [ -z "$RUNTIME" ]; then
-    for r in podman docker; do
+    for r in docker podman; do
         command -v "$r" >/dev/null 2>&1 || continue
         "$r" info >/dev/null 2>&1 || continue
         RUNTIME="$r"; break
@@ -100,14 +102,36 @@ for m in ${kept[@]+"${kept[@]}"}; do ARGS+=(-v "$m:$m"); done
 
 for e in ${ENVS[@]+"${ENVS[@]}"}; do ARGS+=(-e "$e"); done
 
-# Run as root so the build can write anywhere it likes, then hand every mounted
-# tree back to the invoking user -- otherwise a local build leaves root-owned
-# files scattered through the caller's checkout.
-UID_GID="$(id -u):$(id -g)"
-CMD="$(printf '%q ' "$@")"
-CHOWN=""
-for m in ${kept[@]+"${kept[@]}"}; do CHOWN+="chown -R $UID_GID $(printf '%q' "$m"); "; done
+# Run as the INVOKING user, not root.  Everything the build needs is baked into
+# the image, so root buys nothing -- and running as root means every file the
+# build creates in a bind-mounted directory is root-owned.  Chowning the tree
+# back afterwards looks like it fixes that, but it is a repair, and when it does
+# not fully take (rootless podman maps container uids to host subuids, so the
+# chown lands on a uid the caller does not own) the failure surfaces much later
+# as a bare "Permission denied" from an unrelated command.  Creating the files
+# with the right owner in the first place has no such failure mode.
+#
+# HOME is set because the invoking uid has no passwd entry inside the image, and
+# git and gcc both want a writable HOME.
+ARGS+=(--user "$(id -u):$(id -g)" -e "HOME=/tmp")
+# Rootless podman maps the host user to container root by default; keep-id makes
+# the host uid appear unchanged inside, which is what --user above assumes.
+if [ "$RUNTIME" = podman ] && [ "$(id -u)" -ne 0 ]; then
+    ARGS+=(--userns=keep-id)
+fi
 
-exec "$RUNTIME" run --rm --platform linux/amd64 \
+rc=0
+"$RUNTIME" run --rm --platform linux/amd64 \
     "${ARGS[@]}" -w "$PWD" "$GLIBC_BUILDER_IMAGE" \
-    bash -c "set -e; trap '$CHOWN' EXIT; $CMD"
+    bash -c "$(printf '%q ' "$@")" || rc=$?
+
+# Guard the ownership contract explicitly.  If the runtime ever hands back a
+# tree the caller cannot write to, say so here -- otherwise it surfaces as an
+# unexplained "Permission denied" from whatever host command runs next, several
+# steps away from the cause.
+for m in ${kept[@]+"${kept[@]}"}; do
+    [ -w "$m" ] || die "$m is not writable after the container run
+       ($RUNTIME did not preserve ownership: it is owned by uid $(stat -c%u "$m"),
+        you are uid $(id -u)).  Files the build created are unusable from here."
+done
+exit $rc

@@ -28,7 +28,7 @@ jobs:
     # of two that can drift apart.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: read pins
         id: pins
@@ -37,7 +37,7 @@ jobs:
           echo "ffmpeg_tag=$FFMPEG_TAG" >> "$GITHUB_OUTPUT"
 
       - name: cache FFmpeg source
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: _ffmpeg/src
           key: ffmpeg-src-${{ steps.pins.outputs.ffmpeg_tag }}
@@ -55,7 +55,7 @@ jobs:
       - name: verify
         run: ./scripts/check-ffmpeg-libs.sh prebuilt/ffmpeg-aac
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ffmpeg-aac
           path: prebuilt/ffmpeg-aac/
@@ -67,7 +67,7 @@ jobs:
     # there is no job-level container and no duplicated package list here.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Builds e9patch/e9tool AND compiles src/trampoline/aacadd.c against them,
       # so the shipped trampoline is always the one this repo's source produces.
@@ -88,7 +88,7 @@ jobs:
              vendor/e9patch/LICENSE out/e9patch/
           cp vendor/aacadd out/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: e9patch
           path: out/
@@ -98,14 +98,14 @@ jobs:
   pylibs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with: { python-version: '3.11' }
       # manylinux2014 wheels == glibc 2.17, well under the floor.  Vendoring
       # these is what lets a release tarball run with nothing but python3.
       - name: vendor capstone + pyelftools
         run: ./scripts/dev-setup.sh pylibs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pylibs
           path: vendor/pylibs/
@@ -116,14 +116,14 @@ jobs:
     needs: [ffmpeg, e9patch, pylibs]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 0 }      # so `git describe` sees the tag
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: ffmpeg-aac, path: prebuilt/ffmpeg-aac }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: e9patch, path: vendor }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: pylibs, path: vendor/pylibs }
 
       # Only the downloaded artifacts need this: upload-artifact does not
@@ -174,14 +174,14 @@ jobs:
            test ! -e /tmp/layout/usr/lib/resolve-aacfix
 
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-tarball
           path: dist/
 
       - name: publish release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/*.tar.gz

@@ -16,7 +16,7 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shellcheck --severity=warning \
-            aac-fix aac-patch-tree \
+            aac-fix aac-patch-tree install.sh uninstall.sh \
             scripts/*.sh \
             tools/make-testdata.sh tools/cov-run \
             tools/run-resolve-gdb tools/run-resolve-trace \

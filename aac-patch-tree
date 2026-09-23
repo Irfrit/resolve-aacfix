@@ -29,20 +29,12 @@
 set -euo pipefail
 
 SELF="$(readlink -f "$0")"
-# The repo root IS the package root: aacpatch/, vendor/ and prebuilt/ are all
-# siblings of this script, both in a git checkout and in a release tarball.
 PKG="$(cd "$(dirname "$SELF")" && pwd)"
 REPO="$PKG"
 
-# --- toolchain / payload ------------------------------------------------
-# These select an executable (e9tool), code compiled into /opt/resolve/bin/resolve
-# (the trampoline) and libraries installed into /opt: all executable payload.
-# Env overrides are a developer convenience, so they are IGNORED when we are root
-# via sudo -- otherwise a restricted NOPASSWD sudoers rule for this tool would be
-# a trivial root-code-execution primitive.  Set AAC_ALLOW_ENV_OVERRIDE=1 to opt in.
 if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && \
    [ -z "${AAC_ALLOW_ENV_OVERRIDE:-}" ]; then
-    for _v in AAC_E9TOOL AAC_TRAMPOLINE AAC_LIBS; do
+    for _v in AAC_E9TOOL AAC_TRAMPOLINE AAC_LIBS AAC_LOCK_FILE AAC_TEST_FAKE_PATCH AAC_TEST_FAIL_AFTER AAC_TEST_KILL_AFTER; do
         if [ -n "$(eval "printf '%s' \"\${$_v:-}\"")" ]; then
             printf '\033[33m[warn]\033[0m ignoring %s (running as root via sudo)\n' "$_v" >&2
             unset "$_v"
@@ -50,427 +42,167 @@ if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && \
     done
     unset _v
 fi
-E9TOOL="${AAC_E9TOOL:-$PKG/vendor/e9patch/e9tool}"
-TRAMPOLINE="${AAC_TRAMPOLINE:-$PKG/vendor/aacadd}"
-LIBS_SRC="${AAC_LIBS:-$PKG/prebuilt/ffmpeg-aac}"
-FFMPEG_LIBS=(libavcodec.so.60.3.100 libavformat.so.60.3.100
-             libavutil.so.58.2.100 libswscale.so.7.1.100)
 
-BIN_REL="bin/resolve"
-BIN_BAK="bin/resolve.aac-orig"
-LIB_BAK="libs/_bmd_orig"
-
+E9TOOL="${AAC_E9TOOL:-$REPO/vendor/e9patch/e9tool}"
+TRAMPOLINE="${AAC_TRAMPOLINE:-$REPO/vendor/aacadd}"
+LIBS_SRC="${AAC_LIBS:-$REPO/prebuilt/ffmpeg-aac}"
+PYLIBS="$REPO/vendor/pylibs"
 KEEP=keep
 MKV=1
 VERBOSE=0
+JSON=0
+REQUIRE_ACTIVE=0
+PYTHON=""
+LOCK_FILE=""
+NO_LOCK=0
 
-msg()  { printf '  %s\n' "$*"; }
-info() { printf '\033[1m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[33m[warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
-
+warn() { printf '\033[33m[warn]\033[0m %s\n' "$*" >&2; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
-sha()    { sha256sum "$1" | cut -d' ' -f1; }
-sha_eq() { [ -e "$1" ] && [ -e "$2" ] && [ "$(sha "$1")" = "$(sha "$2")" ]; }
 
-# Does this libavcodec actually provide an AAC decoder?
-#
-# NOT "is it byte-identical to the copy we ship" -- that reports any other
-# AAC-enabled build, including one from an earlier release of this tool, as
-# though AAC were missing.  Ask the library instead.
-lib_has_aac() {
-    local lib="$1" rc=2
-    if command -v python3 >/dev/null 2>&1; then
-        # Definitive, and needs only ctypes from the stdlib -- not the
-        # capstone/pyelftools the patcher itself requires.
-        python3 -c '
-import ctypes, os, sys
-try:
-    c = ctypes.CDLL(os.path.abspath(sys.argv[1]))
-    c.avcodec_find_decoder.restype = ctypes.c_void_p
-    sys.exit(0 if c.avcodec_find_decoder(0x15002) else 1)   # AV_CODEC_ID_AAC
-except OSError:
-    sys.exit(2)                                             # could not load
-' "$lib" 2>/dev/null
-        rc=$?
-        case "$rc" in 0) return 0 ;; 1) return 1 ;; esac
-    fi
-    # Fallback when the library will not load here (wrong glibc, missing deps).
-    # Blackmagic strip AAC at configure time, and every FFmpeg library embeds
-    # its configure line -- so their build is identifiable by its own flag.
-    grep -qa -- "--disable-decoder='aac" "$lib" && return 1
-    return 0
+verify_payload() {
+    local manifest="$REPO/SHA256SUMS"
+    [ -f "$manifest" ] || {
+        warn "no SHA256SUMS manifest; payload integrity unverified"
+        return 0
+    }
+    ( cd "$REPO" && sha256sum --quiet -c SHA256SUMS ) >/dev/null 2>&1 || \
+        die "payload checksum mismatch against $manifest --
+       vendor/ or prebuilt/ has been modified.  Refusing to patch.
+       (Run 'sha256sum -c SHA256SUMS' in $REPO to see which file.)"
 }
 
-# e9patch appends an extra LOAD segment; stock Resolve has exactly 4.  This is
-# the authoritative signal: an earlier version also grepped for a marker string,
-# but that only ever worked because of a stale prebuilt trampoline and silently
-# degraded to "not patched" once the trampoline was rebuilt from source.
-load_count() { readelf -lW "$1" 2>/dev/null | grep -c '^[[:space:]]*LOAD'; }
-
-is_patched() {
-    local n; n="$(load_count "$1")"
-    [ -n "$n" ] && [ "$n" -gt 4 ] 2>/dev/null
-}
-
-# Is every byte the ELF's LOAD headers declare actually present?  A truncated
-# copy still has valid headers near the front -- `readelf -h` succeeds and the
-# LOAD count still reads 4 -- so size is the only thing that catches it.
-elf_complete() {
-    local f="$1" o sz end max=0 size
-    while read -r o sz; do
-        [ -n "$o" ] || continue
-        end=$(( o + sz ))                     # bash parses the 0x.. literals
-        [ "$end" -gt "$max" ] && max=$end
-    done < <(readelf -lW "$f" 2>/dev/null | awk '/^[[:space:]]*LOAD/{print $2, $5}')
-    [ "$max" -gt 0 ] || return 1
-    size="$(stat -c%s "$f" 2>/dev/null || echo 0)"
-    [ "$size" -ge "$max" ]
-}
-
-# A file we are willing to treat as a pristine Resolve binary.
-looks_like_stock_resolve() {
-    local b="$1" n
-    [ -f "$b" ] || return 1
-    readelf -h "$b" >/dev/null 2>&1 || return 1       # must be a valid ELF
-    n="$(load_count "$b")"; [ "$n" = 4 ] || return 1  # 4 LOAD == unpatched
-    elf_complete "$b" || return 1                     # ... and not truncated
-    return 0
-}
-
-# Record/verify a checksum next to the kept original, so a backup that was
-# truncated by an interrupted copy or a full disk can never be restored over a
-# working binary.
-bak_sha_file() { printf '%s' "$1/bin/.resolve.aac-orig.sha256"; }
-
-verify_backup() {                 # $1 = root -- 0 if the kept original is sound
-    local R="$1" bak="$1/$BIN_BAK" shafile; shafile="$(bak_sha_file "$R")"
-    [ -f "$bak" ] || return 1
-    looks_like_stock_resolve "$bak" || return 1
-    if [ -f "$shafile" ]; then
-        [ "$(sha "$bak")" = "$(cat "$shafile")" ] || return 1
-    fi
-    return 0
-}
-
-# Release tarballs vendor capstone + pyelftools under vendor/pylibs so the only
-# hard requirement is a python3 interpreter.  A dev checkout falls back to a
-# virtualenv or whatever python3 has them installed.
-PYLIBS="$REPO/vendor/pylibs"
 pick_python() {
     local p
     for p in "$REPO/.venv/bin/python" python3; do
         command -v "$p" >/dev/null 2>&1 || continue
         if PYTHONPATH="$PYLIBS" "$p" -c 'import capstone, elftools' >/dev/null 2>&1; then
-            printf '%s' "$p"; return 0
+            printf '%s' "$p"
+            return 0
         fi
     done
     die "need python3 with the 'capstone' and 'pyelftools' modules
        (they are vendored in release tarballs under vendor/pylibs; from a git
-        checkout run: pip install capstone pyelftools)"
+       checkout run: pip install capstone pyelftools)"
 }
 
 preflight() {
-    # is_patched/verify_backup depend on readelf; without it every binary looks
-    # unpatched and the tool would happily double-patch.
-    need_cmd readelf
+    need_cmd flock
     need_cmd sha256sum
+    if [ "${AAC_TEST_FAKE_PATCH:-0}" = 1 ]; then
+        PYTHON="$(command -v python3)" || die "missing required command: python3"
+        return
+    fi
     [ -x "$E9TOOL" ]     || die "e9tool not found/executable: $E9TOOL"
     [ -e "$TRAMPOLINE" ] || die "trampoline not found: $TRAMPOLINE"
     [ -d "$LIBS_SRC" ]   || die "AAC FFmpeg libs not found: $LIBS_SRC"
-    local l
-    for l in "${FFMPEG_LIBS[@]}"; do
-        [ -e "$LIBS_SRC/$l" ] || die "AAC lib missing: $LIBS_SRC/$l"
-    done
     verify_payload
     PYTHON="$(pick_python)"
 }
 
-# The trampoline is compiled into the patched binary and the libs are installed
-# into /opt: both are executable payload.  If a manifest is present, everything
-# must match it -- otherwise a swapped-in blob would be applied without notice.
-verify_payload() {
-    local manifest="$PKG/SHA256SUMS"
-    [ -f "$manifest" ] || { warn "no SHA256SUMS manifest; payload integrity unverified"; return 0; }
-    ( cd "$PKG" && sha256sum --quiet -c SHA256SUMS ) >/dev/null 2>&1 || \
-        die "payload checksum mismatch against $manifest --
-       vendor/ or prebuilt/ has been modified.  Refusing to patch.
-       (Run 'sha256sum -c SHA256SUMS' in $PKG to see which file.)"
+status_preflight() {
+    need_cmd flock
+    need_cmd python3
+    PYTHON="$(command -v python3)"
 }
 
-check_root() {
-    local R="$1"
-    [ -n "$R" ]            || die "no Resolve root given (see --help)"
-    [ -d "$R" ]            || die "not a directory: $R"
-    [ -f "$R/$BIN_REL" ]   || die "no Resolve binary at $R/$BIN_REL -- is this a Resolve root?"
-    [ -d "$R/libs" ]       || die "no libs/ directory in $R -- is this a Resolve root?"
+run_python() {
+    env "PYTHONPATH=$REPO:$PYLIBS" "$PYTHON" -m aacpatch.lifecycle "$@"
 }
 
-# patch SRC -> OUT with the additive patcher
-run_patch() {
-    local src="$1" out="$2" args=()
-    [ "$MKV" = 1 ] && args+=(--mkv)
-    if [ "$VERBOSE" = 1 ]; then
-        AAC_E9TOOL="$E9TOOL" AAC_TRAMPOLINE="$TRAMPOLINE" PYTHONPATH="$REPO:$PYLIBS" \
-            "$PYTHON" -m aacpatch.additive "$src" -o "$out" "${args[@]}"
-    else
-        # Keep the huge e9tool command line out of the way, but never discard
-        # diagnostics: everything goes to a log we point at on failure.
-        local log; log="$(mktemp "${TMPDIR:-/tmp}/aac-patch.XXXXXX.log")"
-        set +e
-        AAC_E9TOOL="$E9TOOL" AAC_TRAMPOLINE="$TRAMPOLINE" PYTHONPATH="$REPO:$PYLIBS" \
-            "$PYTHON" -m aacpatch.additive "$src" -o "$out" "${args[@]}" >"$log" 2>&1
-        local rc=$?
-        set -e
-        grep -E 'num_patched|^error|refusing|not found' "$log" | sed 's/^/    /' || true
-        if [ $rc -ne 0 ]; then
-            warn "patcher failed; full output: $log"
-        else
-            rm -f "$log"
+run_locked() {
+    local mode="$1"
+    shift
+    local lock_target="$ROOT"
+    if [ -n "$LOCK_FILE" ]; then
+        lock_target="$LOCK_FILE"
+    elif [ -n "${AAC_LOCK_FILE:-}" ]; then
+        lock_target="$AAC_LOCK_FILE"
+        local lock_parent="${lock_target%/*}"
+        [ "$lock_parent" = "$lock_target" ] && lock_parent="."
+        [ -d "$lock_parent" ] || die "lock directory not found: $lock_parent"
+        if [ -L "$lock_target" ] || { [ -e "$lock_target" ] && [ ! -f "$lock_target" ]; }; then
+            die "lock file is not a regular file: $lock_target"
         fi
-        return $rc
+        [ -e "$lock_target" ] || touch -- "$lock_target" || \
+            die "cannot create lock file: $lock_target"
     fi
-    return "${PIPESTATUS[0]}"
-}
-
-# --- apply --------------------------------------------------------------
-
-apply_binary() {
-    local R="$1"
-    local bin="$R/$BIN_REL" bak="$R/$BIN_BAK" src shafile
-    local made_backup=0
-    shafile="$(bak_sha_file "$R")"
-
-    if is_patched "$bin"; then
-        # Never patch an already-patched binary -- we need a pristine baseline.
-        if [ -f "$bak" ]; then
-            verify_backup "$R" || die "$bak is corrupt (truncated copy, or it is
-       not a stock Resolve binary) -- refusing to use it as a baseline.
-       Reinstall Resolve to recover a clean binary."
-            msg "binary already patched; re-applying from the kept original"
-            src="$bak"
-        else
-            die "$bin is already patched and no pristine original is kept
-       (expected $bak).
-
-       The patch cannot be applied on top of itself, and it cannot be undone
-       without the original: e9patch offers no unpatch, so nothing here can
-       reconstruct it.  Get a clean binary back, then apply again:
-
-         from a package      sudo apt install --reinstall davinci-resolve-studio
-         from the installer  aac-fix build-deb DaVinci_Resolve_Studio_<ver>.run
-                             (patches a fresh copy; nothing to undo)
-
-       This is the trade --originals remove makes.  Use the default
-       (--originals keep) on a live install to keep revert and re-apply working."
-        fi
-    else
-        src="$bin"
-    fi
-
-    if [ "$KEEP" = keep ]; then
-        if [ -f "$bak" ] && [ "$src" != "$bak" ]; then
-            # An existing backup must be sound before we trust/keep it.
-            verify_backup "$R" || die "$bak already exists but is corrupt --
-       refusing to overwrite or trust it.  Remove it by hand if you are sure
-       $bin is the stock binary."
-        elif [ ! -f "$bak" ]; then
-            # Write the backup atomically: a plain cp interrupted by Ctrl-C, a
-            # full disk or an OOM kill leaves a TRUNCATED backup that a later
-            # `revert` would happily install over a working binary.
-            cp -p "$src" "$bak.tmp" || { rm -f "$bak.tmp"; die "failed to back up $bin (disk full?)"; }
-            mv -f "$bak.tmp" "$bak"
-            sha "$bak" > "$shafile.tmp" && mv -f "$shafile.tmp" "$shafile"
-            msg "kept original binary -> $BIN_BAK"
-            src="$bak"
-            made_backup=1
-        fi
-    fi
-
-    if ! run_patch "$src" "$bin.aac-tmp"; then
-        rm -f "$bin.aac-tmp"
-        # Don't leave a 653MB backup lying around after a refusal.  The most
-        # likely reason to get here is an unrecognised Resolve build, and the
-        # user should be able to retry a newer release of this tool without
-        # first hunting down a stray copy of their binary.
-        if [ "${made_backup:-0}" = 1 ]; then
-            rm -f "$bak" "$shafile"
-            msg "removed the backup taken this run ($BIN_BAK)"
-        fi
-        die "patching failed; $bin left untouched"
-    fi
-    # Fixed mode, never --reference: the source may be a developer copy that is
-    # world-writable, which would make /opt/resolve/bin/resolve world-writable
-    # too (local code execution for anyone who launches Resolve).
-    chmod 0755 "$bin.aac-tmp"
-    [ "$(id -u)" -eq 0 ] && chown 0:0 "$bin.aac-tmp" 2>/dev/null || true
-    mv -f "$bin.aac-tmp" "$bin"
-    msg "patched $BIN_REL"
-
-    if [ "$KEEP" != keep ]; then
-        rm -f "$bak" "$shafile"
-        msg "removed kept original ($BIN_BAK)"
-    fi
-}
-
-
-apply_libs() {
-    local R="$1"
-    local libs="$R/libs" bak="$R/$LIB_BAK" l cur
-    [ "$KEEP" = keep ] && mkdir -p "$bak"
-    for l in "${FFMPEG_LIBS[@]}"; do
-        cur="$libs/$l"
-        if [ ! -e "$cur" ]; then warn "expected lib missing, skipping: $l"; continue; fi
-        if sha_eq "$cur" "$LIBS_SRC/$l"; then msg "lib already AAC-enabled: $l"; continue; fi
-        if [ "$KEEP" = keep ] && [ ! -e "$bak/$l" ]; then
-            # atomic, same reasoning as the binary backup above
-            cp -p "$cur" "$bak/$l.tmp" || { rm -f "$bak/$l.tmp"; die "failed to back up $l (disk full?)"; }
-            mv -f "$bak/$l.tmp" "$bak/$l"
-        fi
-        # `cp -p` would preserve the SOURCE ownership: run under sudo that
-        # actually succeeds, leaving /opt/resolve/libs/*.so owned by the
-        # invoking user -- i.e. writable by an unprivileged account.
-        cp "$LIBS_SRC/$l" "$cur.aac-tmp" || { rm -f "$cur.aac-tmp"; die "failed to install $l (disk full?)"; }
-        chmod 0755 "$cur.aac-tmp"
-        [ "$(id -u)" -eq 0 ] && chown 0:0 "$cur.aac-tmp" 2>/dev/null || true
-        mv -f "$cur.aac-tmp" "$cur"
-        msg "installed AAC lib: $l"
-    done
-    if [ "$KEEP" != keep ] && [ -d "$bak" ]; then
-        rm -rf "$bak"; msg "removed kept originals ($LIB_BAK/)"
-    fi
-}
-
-
-cmd_apply() {
-    local R="$1"
-    check_root "$R"; preflight
-    info "Applying AAC fix to $R  (originals: $KEEP)"
-    apply_binary "$R"
-    apply_libs   "$R"
-    [ "$KEEP" = keep ] || warn "originals removed -- 'revert' will not work on this tree"
-    info "Done."
-}
-
-# --- revert -------------------------------------------------------------
-
-cmd_revert() {
-    local R="$1" bin bak l shafile
-    check_root "$R"
-    bin="$R/$BIN_REL"; bak="$R/$BIN_BAK"; shafile="$(bak_sha_file "$R")"
-    info "Reverting AAC fix in $R"
-    if [ -f "$bak" ]; then
-        # Restoring a truncated/corrupt backup over a working binary is the
-        # worst thing this tool could do, so the backup is validated first.
-        if verify_backup "$R"; then
-            mv -f "$bak" "$bin"; rm -f "$shafile"
-            msg "restored original binary"
-        else
-            die "$bak is corrupt or is not a stock Resolve binary --
-       REFUSING to restore it over $bin.
-       $bin has been left alone; reinstall Resolve to recover."
-        fi
-    elif is_patched "$bin"; then
-        warn "binary is patched but no original was kept ($BIN_BAK missing) --
-       cannot restore it.  Reinstall Resolve's package to get a stock binary."
-    else
-        msg "binary already original"
-    fi
-    if [ -d "$R/$LIB_BAK" ]; then
-        for l in "${FFMPEG_LIBS[@]}"; do
-            [ -e "$R/$LIB_BAK/$l" ] && { mv -f "$R/$LIB_BAK/$l" "$R/libs/$l"; msg "restored original lib: $l"; }
-        done
-        rmdir "$R/$LIB_BAK" 2>/dev/null || true
-    else
-        msg "no kept library originals to restore"
-    fi
-    info "Done."
-}
-
-# --- status -------------------------------------------------------------
-
-cmd_status() {
-    local R="$1" bin l cur n_aac=0 n_ours=0
-    check_root "$R"
-    bin="$R/$BIN_REL"
-    info "AAC-fix status for $R"
-    if is_patched "$bin"; then msg "binary:  PATCHED"; else msg "binary:  original"; fi
-    [ -f "$R/$BIN_BAK" ] && msg "         original kept ($BIN_BAK)"
-    for l in "${FFMPEG_LIBS[@]}"; do
-        cur="$R/libs/$l"
-        if [ ! -e "$cur" ]; then msg "lib:     $l  MISSING"; continue; fi
-        # Only libavcodec carries the decoder; the other three are replaced as a
-        # set because they must match it, so judge the set by that one.
-        case "$l" in
-            libavcodec.*)
-                if lib_has_aac "$cur"; then
-                    if sha_eq "$cur" "$LIBS_SRC/$l"; then
-                        msg "lib:     $l  AAC-enabled (this build)"; n_ours=$((n_ours+1))
-                    else
-                        msg "lib:     $l  AAC-enabled (a different build)"
-                    fi
-                    n_aac=$((n_aac+1))
-                else
-                    msg "lib:     $l  no AAC (Blackmagic's build)"
-                fi ;;
-            *)
-                if sha_eq "$cur" "$LIBS_SRC/$l"; then
-                    msg "lib:     $l  installed (this build)"; n_ours=$((n_ours+1))
-                else msg "lib:     $l  present"; fi
-                n_aac=$((n_aac+1)) ;;
-        esac
-    done
-    [ -d "$R/$LIB_BAK" ] && msg "         library originals kept ($LIB_BAK/)"
-    # Our libavcodec does not export the three AVS3 helpers Blackmagic's does,
-    # so it is not a drop-in for theirs on its own -- the four must match each
-    # other.  A half-swapped set loads until something touches AV3A.
-    if [ "$n_ours" -gt 0 ] && [ "$n_ours" -lt "${#FFMPEG_LIBS[@]}" ]; then
-        warn "mixed library set: $n_ours of ${#FFMPEG_LIBS[@]} are this build's.
-       These four must be installed together -- re-run apply."
-    fi
-    if is_patched "$bin" && [ "$n_aac" -eq "${#FFMPEG_LIBS[@]}" ]; then
-        info "AAC support: ACTIVE"
-    elif is_patched "$bin"; then
-        warn "binary patched but FFmpeg libs lack AAC -- audio will NOT decode"
-    else
-        info "AAC support: not installed"
-    fi
+    local -a command=(env "PYTHONPATH=$REPO:$PYLIBS" "$PYTHON" -m aacpatch.lifecycle "$@")
+    flock "--$mode" "$lock_target" "${command[@]}"
 }
 
 usage() {
-    # print the header comment block (from line 3) and stop at the first
-    # non-comment line, so the help can never spill into the code
-    awk 'NR>=3 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$SELF"
+    local number=0 line
+    while IFS= read -r line; do
+        number=$((number + 1))
+        [ "$number" -ge 3 ] || continue
+        case "$line" in
+            '# '*) printf '%s\n' "${line#\# }" ;;
+            '#'*) printf '%s\n' "${line#\#}" ;;
+            *) break ;;
+        esac
+    done < "$SELF"
     exit "${1:-0}"
 }
 
 main() {
-    local cmd="${1:-}"; shift || true
+    local cmd="${1:-}"
+    shift || true
     local root=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --originals)
                 [ $# -ge 2 ] || die "--originals needs an argument (keep|remove)"
                 KEEP="$2"; shift 2
-                [ "$KEEP" = keep ] || [ "$KEEP" = remove ] || die "--originals must be keep|remove" ;;
+                [ "$KEEP" = keep ] || [ "$KEEP" = remove ] || \
+                    die "--originals must be keep|remove" ;;
             --keep-originals)   KEEP=keep;   shift ;;
             --remove-originals) KEEP=remove; shift ;;
+            --lock-file)
+                [ $# -ge 2 ] || die "--lock-file needs an argument"
+                LOCK_FILE="$2"; shift 2 ;;
+            --no-lock) NO_LOCK=1; shift ;;
             --no-mkv)  MKV=0; shift ;;
+            --json) JSON=1; shift ;;
+            --require-active) REQUIRE_ACTIVE=1; shift ;;
             -v|--verbose) VERBOSE=1; shift ;;
             -h|--help) usage 0 ;;
             --*) die "unknown option: $1" ;;
             *) [ -z "$root" ] || die "only one Resolve root may be given"; root="$1"; shift ;;
         esac
     done
-    # canonicalise: e9tool resolves a bare relative path against $PATH, and
-    # absolute paths keep every message unambiguous
-    [ -n "$root" ] && [ -e "$root" ] && root="$(readlink -f "$root")"
     case "$cmd" in
-        apply)  cmd_apply  "$root" ;;
-        revert) cmd_revert "$root" ;;
-        status) cmd_status "$root" ;;
+        -h|--help|help|"") usage 0 ;;
+        apply|revert|status) ;;
+        *) die "unknown subcommand: $cmd (try --help)" ;;
+    esac
+    [ -n "$root" ] || die "no Resolve root given (see --help)"
+    [ -d "$root" ] || die "not a directory: $root"
+    root="$(readlink -f "$root")"
+    ROOT="$root"
+    case "$cmd" in
+        apply|revert) preflight ;;
+        status) status_preflight ;;
         -h|--help|help|"") usage 0 ;;
         *) die "unknown subcommand: $cmd (try --help)" ;;
     esac
+    local -a args=("$cmd" "$ROOT" --originals "$KEEP" --libs "$LIBS_SRC" --repo "$REPO" \
+        --pylibs "$PYLIBS" --patch-python "$PYTHON" --e9tool "$E9TOOL" \
+        --trampoline "$TRAMPOLINE")
+    [ "$MKV" -eq 0 ] && args+=(--no-mkv)
+    [ "$VERBOSE" -eq 1 ] && args+=(--verbose)
+    [ "$JSON" -eq 1 ] && args+=(--json)
+    [ "$REQUIRE_ACTIVE" -eq 1 ] && args+=(--require-active)
+    if [ "${AAC_TEST_FAKE_PATCH:-0}" = 1 ]; then
+        args+=(--fake-patch)
+        [ -z "${AAC_TEST_FAIL_AFTER:-}" ] || args+=(--fail-after-commit "$AAC_TEST_FAIL_AFTER")
+    fi
+    case "$cmd" in
+        apply|revert)
+            if [ "$NO_LOCK" -eq 1 ]; then run_python "${args[@]}"; else run_locked exclusive "${args[@]}"; fi ;;
+        status)
+            if [ "$NO_LOCK" -eq 1 ]; then run_python "${args[@]}"; else run_locked shared "${args[@]}"; fi ;;
+    esac
 }
+
 main "$@"

@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the Omarchy Resolve installation marker
+
+[Path]
+PathChanged=/opt/resolve/.omarchy-resolve.json
+Unit=resolve-aacfix-reapply.service
+
+[Install]
+WantedBy=multi-user.target

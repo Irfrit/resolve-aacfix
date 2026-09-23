@@ -163,8 +163,16 @@ jobs:
           grep -q 'cannot locate a patch site' /tmp/apply.log
           # A refusal must leave the tree exactly as it was found -- no partial
           # output, and no 653MB backup stranded from the run that failed.
-          test ! -e /tmp/fake/bin/resolve.aac-tmp
-          test ! -e /tmp/fake/bin/resolve.aac-orig
+           test ! -e /tmp/fake/bin/resolve.aac-tmp
+           test ! -e /tmp/fake/bin/resolve.aac-orig
+           rm -rf /tmp/layout
+           "$pkg/install.sh" --root /tmp/layout --no-auto-reapply --no-systemd
+           test -x /tmp/layout/usr/lib/resolve-aacfix/aac-fix
+           test -L /tmp/layout/usr/bin/aac-fix
+           test -f /tmp/layout/usr/lib/systemd/system/resolve-aacfix-reapply.service
+           "$pkg/uninstall.sh" --root /tmp/layout --no-revert
+           test ! -e /tmp/layout/usr/lib/resolve-aacfix
+
 
       - uses: actions/upload-artifact@v4
         with:
@@ -185,13 +193,15 @@ jobs:
           body: |
             Self-contained AAC fix for DaVinci Resolve Studio 21.x on Linux.
 
-            ```sh
-            tar -xzf resolve-aacfix-*.tar.gz
-            cd resolve-aacfix-*
-            sudo ./aac-fix install          # patches /opt/resolve
-            ./aac-fix status
-            sudo ./aac-fix uninstall        # restores the originals
-            ```
+             ```sh
+             sha256sum -c resolve-aacfix-*.tar.gz.sha256
+             tar -xzf resolve-aacfix-*.tar.gz
+             cd resolve-aacfix-*
+             sudo ./install.sh
+             aac-fix status
+             aac-fix auto status
+             sudo ./uninstall.sh
+             ```
 
             Needs only `python3` and `binutils` — capstone, pyelftools, e9patch
             and the AAC-enabled FFmpeg libraries are all bundled. Everything is

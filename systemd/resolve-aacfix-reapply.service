@@ -1,0 +1,28 @@
+[Unit]
+Description=Reapply the DaVinci Resolve AAC fix after installation
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/usr/lib/resolve-aacfix
+ExecStart=/usr/lib/resolve-aacfix/aac-fix auto reapply
+TimeoutStartSec=30min
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+UMask=0022
+ReadWritePaths=-/opt/resolve /var/lib/resolve-aacfix /run/lock
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

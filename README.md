@@ -7,25 +7,30 @@ ordinary `.mp4` and `.mov` files import with silent audio. This puts it back —
 without giving anything else up.
 
 ```sh
+sha256sum -c resolve-aacfix-*.tar.gz.sha256
 tar -xzf resolve-aacfix-*.tar.gz
 cd resolve-aacfix-*
-sudo ./aac-fix install          # close Resolve first
-./aac-fix status
+sudo ./install.sh
+aac-fix status
+aac-fix auto status
 ```
 
-Download the tarball from [Releases](../../releases). It needs only `python3` and
-`binutils`; everything else is bundled.
+Download the tarball and its checksum from [Releases](../../releases). The
+installer copies the package to `/usr/lib/resolve-aacfix` and links
+`/usr/bin/aac-fix`; it needs only `python3` and `binutils`, because the release
+contains the rest.
 
 To undo it completely:
 
 ```sh
-sudo ./aac-fix uninstall
+sudo ./uninstall.sh
 ```
 
-> **Almost all of this work — the reverse engineering, the binary patches, the
-> tooling, and these docs — was done by Claude** (Anthropic's Claude Code). It is
-> published in that spirit: the reasoning is written down at length in
-> [`docs/`](docs/), including the parts that were wrong.
+> **The original reverse engineering, binary patches, and tooling were developed
+> with Claude Code; v0.2 lifecycle and packaging work was developed with
+> OpenCode under user supervision.** The reasoning is written down in
+> [`docs/`](docs/), including the parts that were wrong. See
+> [`AI-PROVENANCE.md`](AI-PROVENANCE.md).
 
 ---
 
@@ -41,6 +46,20 @@ AAC is blocked in two places, and lifting either one alone achieves nothing:
 
 `aac-fix status` reports both, and warns about the half-installed case, because
 "binary patched, libs not" fails silently as no audio.
+
+On Omarchy, installation enables a systemd oneshot and a path trigger for
+`/opt/resolve/.omarchy-resolve.json`. After an Omarchy Resolve update completes,
+the fix verifies the new generation and reapplies. A running Resolve process
+causes a safe deferred result; an unsupported build fails without changing
+Resolve.
+
+```sh
+aac-fix auto status
+sudo aac-fix auto disable
+sudo aac-fix auto enable
+```
+
+`auto disable` persists across package upgrades until explicitly enabled again.
 
 **Every binary change is purely additive.** Each trampoline acts only when the
 value is AAC and otherwise lets the original instruction run untouched. No
@@ -58,9 +77,9 @@ Please read these before installing.
 
 - **Studio only.** Built and tested against DaVinci Resolve **Studio**. The free
   version has not been tested at all.
-- **Resolve 21 only.** Validated on 21.0.0, 21.0.3 and 21.0.4; the full
-  end-to-end test was on **21.0.4**. Because sites are located by signature, newer
-  21.x point releases *should* work — but this has not been tested beyond 21.0.4.
+- **Resolve 21 only.** Validated on 21.0.0, 21.0.3, 21.0.4, and the installed
+  21.1 Studio build. Because sites are located by signature, newer 21.x point
+  releases *should* work, but unrecognised builds are refused without changes.
   **If the patcher refuses, or something misbehaves, please [file an
   issue](../../issues)** with your exact Resolve version and the output of
   `./aac-fix status`. A refusal is a broken feature, not a broken install: it
@@ -79,13 +98,18 @@ Please read these before installing.
   video track in the file, or use another container.
 - **HE-AAC sample rate:** only *explicit* SBR/PS signalling is handled. Implicit
   SBR and the AOT=31 escape will report the base sample rate.
-- **Close Resolve before installing or uninstalling.** Writing a running binary
-  fails with `ETXTBSY`.
+- **Close Resolve before manual install or uninstall.** The command refuses while
+  Resolve is running; automatic reapply records a safe deferred result instead.
 - **No warranty.** This modifies a large proprietary binary in place. It keeps a
   verified backup and refuses to restore a corrupt one, but you should be able to
   reinstall Resolve if you need to.
 
 ## Licensing
+
+This repository is a maintained fork of
+[`josephg/resolve-aacfix`](https://github.com/josephg/resolve-aacfix). The
+upstream MIT license and attribution are preserved; v0.2 changes do not relicense
+or obscure that work.
 
 AAC and AC-3 were removed from a shipping product for **licensing, not
 technical, reasons**. This is interoperability work on a binary you have already

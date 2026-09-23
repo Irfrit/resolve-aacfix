@@ -11,7 +11,11 @@
 # Usage:
 #   aac-fix install   [RESOLVE_ROOT]        patch an install (default /opt/resolve)
 #   aac-fix uninstall [RESOLVE_ROOT]        restore the originals kept at install
-#   aac-fix status    [RESOLVE_ROOT]        report what's applied
+#   aac-fix status    [--json] [--require-active] [RESOLVE_ROOT]
+#                                           report what's applied
+#   aac-fix auto status [--json] [--require-active]
+#   aac-fix auto enable                    enable automatic reapply
+#   aac-fix auto disable                   disable automatic reapply
 #   aac-fix build-deb INSTALLER.run [MRD.sh]
 #                                           build a patched .deb from the .run
 #                                           (makeresolvedeb auto-downloaded and
@@ -27,6 +31,11 @@ PKG="$(cd "$(dirname "$SELF")" && pwd)"
 CORE="$PKG/aac-patch-tree"
 
 DEFAULT_ROOT=/opt/resolve
+AUTO_CONFIG=/etc/resolve-aacfix/auto.conf
+AUTO_RESULT=/var/lib/resolve-aacfix/last-result.json
+AUTO_LOCK=/run/lock/omarchy-resolve.lock
+PYTHON=""
+LOCK_FD=""
 
 # pinned makeresolvedeb (verified against this sha256 after download)
 MRD_URL="https://www.danieltufvesson.com/download/?file=makeresolvedeb/makeresolvedeb_1.10.0_multi.sh.tar.gz"
@@ -38,6 +47,103 @@ info() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+pick_python() {
+    local candidate
+    for candidate in "$PKG/.venv/bin/python" python3; do
+        command -v "$candidate" >/dev/null 2>&1 || continue
+        printf '%s' "$candidate"
+        return 0
+    done
+    die "python3 is required"
+}
+
+pick_patch_python() {
+    local candidate
+    for candidate in "$PKG/.venv/bin/python" python3; do
+        command -v "$candidate" >/dev/null 2>&1 || continue
+        if PYTHONPATH="$PKG/vendor/pylibs" "$candidate" -c 'import capstone, elftools' >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    die "python3 with capstone and pyelftools is required"
+}
+
+ensure_root() {
+    [ "$(id -u)" -eq 0 ] || die "this command requires root"
+}
+
+ensure_lock_file() {
+    [ -d "$(dirname "$AUTO_LOCK")" ] || die "lock directory not found: $(dirname "$AUTO_LOCK")"
+    if [ -L "$AUTO_LOCK" ] || { [ -e "$AUTO_LOCK" ] && [ ! -f "$AUTO_LOCK" ]; }; then
+        die "lock file is not a regular file: $AUTO_LOCK"
+    fi
+    [ -e "$AUTO_LOCK" ] || touch -- "$AUTO_LOCK" || die "cannot create lock file: $AUTO_LOCK"
+    [ -f "$AUTO_LOCK" ] || die "lock file is not a regular file: $AUTO_LOCK"
+    [ -O "$AUTO_LOCK" ] || die "lock file is not root-owned: $AUTO_LOCK"
+    chmod 0644 "$AUTO_LOCK"
+}
+
+lock_target() {
+    local root="$1"
+    if [ "$(id -u)" -ne 0 ] && [ -n "${AAC_LOCK_FILE:-}" ]; then
+        printf '%s' "$AAC_LOCK_FILE"
+    elif [ -e "$AUTO_LOCK" ]; then
+        printf '%s' "$AUTO_LOCK"
+    else
+        printf '%s' "$root"
+    fi
+}
+
+acquire_lock() {
+    local mode="$1" root="$2" target
+    target="$(lock_target "$root")"
+    if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ] && [ ! -d "$target" ]; }; then
+        die "lock target is not a regular file or directory: $target"
+    fi
+    if [ -d "$target" ]; then
+        exec {LOCK_FD}<"$target"
+    else
+        [ -e "$target" ] || touch -- "$target" || die "cannot create lock file: $target"
+        exec {LOCK_FD}<"$target"
+    fi
+    flock "--$mode" "$LOCK_FD"
+}
+
+release_lock() {
+    [ -n "$LOCK_FD" ] || return 0
+    flock --unlock "$LOCK_FD"
+    exec {LOCK_FD}>&-
+    LOCK_FD=""
+}
+
+run_locked() {
+    local mode="$1" root="$2"
+    shift 2
+    acquire_lock "$mode" "$root"
+    local code=0
+    if "$@"; then code=0; else code=$?; fi
+    release_lock
+    return "$code"
+}
+
+resolve_processes() {
+    local root="$1" output
+    output="$(PYTHONPATH="$PKG" "$PYTHON" -m aacpatch.proc --resolve-root "$root" 2>/dev/null || true)"
+    printf '%s' "$output"
+}
+
+auto_python() {
+    PYTHONPATH="$PKG" "$PYTHON" -m aacpatch.auto "$@"
+}
+
+validate_marker() {
+    local marker="$1"
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+        auto_python check-marker --marker "$marker"
+    fi
+}
 
 [ -x "$CORE" ] || die "core patcher not found/executable: $CORE"
 
@@ -70,33 +176,122 @@ ensure_writable() {
 # rename keeps the old inode alive, but a later lazy dlopen picks up a library
 # that no longer matches the running image.  Refuse rather than warn.
 refuse_if_running() {
-    local pids
-    pids="$(pgrep -x resolve 2>/dev/null || true)"
-    [ -z "$pids" ] || die "DaVinci Resolve is running (pid: $(echo $pids | tr '\n' ' '))
+    local pids formatted
+    [ -n "${AAC_ALLOW_RUNNING:-}" ] && return 0
+    pids="$(resolve_processes "$1")"
+    [ -z "$pids" ] || {
+        formatted="$(printf '%s' "$pids" | tr '\n' ' ')"
+        die "DaVinci Resolve is running (pid: $formatted)
        Close it first -- patching underneath a live process gives it a
-       mismatched mix of old and new libraries.
-       Override with AAC_ALLOW_RUNNING=1 if you know what you are doing."
+       mismatched mix of old and new libraries."
+    }
+}
+
+core_apply() {
+    local root="$1"
+    validate_marker "$root/.omarchy-resolve.json"
+    refuse_if_running "$root"
+    "$CORE" apply --originals keep "$root" --no-lock
+}
+
+core_revert() {
+    local root="$1"
+    validate_marker "$root/.omarchy-resolve.json"
+    refuse_if_running "$root"
+    "$CORE" revert "$root" --no-lock
 }
 
 cmd_install() {
     local R="${1:-$DEFAULT_ROOT}"
     [ -d "$R" ] || die "Resolve root not found: $R"
-    [ -n "${AAC_ALLOW_RUNNING:-}" ] || refuse_if_running
     ensure_writable "$R"
-    "$CORE" apply --originals keep "$R"
+    PYTHON="$(pick_patch_python)"
+    run_locked exclusive "$R" core_apply "$R"
     info "Restart Resolve; AAC audio should now decode."
 }
 
 cmd_uninstall() {
     local R="${1:-$DEFAULT_ROOT}"
     [ -d "$R" ] || die "Resolve root not found: $R"
-    [ -n "${AAC_ALLOW_RUNNING:-}" ] || refuse_if_running
     ensure_writable "$R"
-    "$CORE" revert "$R"
+    PYTHON="$(pick_patch_python)"
+    run_locked exclusive "$R" core_revert "$R"
 }
 
 cmd_status() {
-    "$CORE" status "${1:-$DEFAULT_ROOT}"
+    local R="$DEFAULT_ROOT" json=0 require_active=0 root_seen=""
+    if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+        R="$1"
+        root_seen=1
+        shift
+    fi
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            --require-active) require_active=1; shift ;;
+            --*) die "unknown option: $1" ;;
+            *) [ -z "$root_seen" ] || die "only one Resolve root may be given"; R="$1"; root_seen=1; shift ;;
+        esac
+    done
+    local -a args=(status "$R")
+    [ "$json" -eq 1 ] && args+=(--json)
+    [ "$require_active" -eq 1 ] && args+=(--require-active)
+    run_locked shared "$R" "$CORE" "${args[@]}" --no-lock
+}
+
+cmd_auto() {
+    local action="${1:-}"
+    shift || true
+    case "$action" in
+        status)
+            local R="$DEFAULT_ROOT" json=0 require_active=0 root_seen=""
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --json) json=1; shift ;;
+                    --require-active) require_active=1; shift ;;
+                    --*) die "unknown option: $1" ;;
+                    *) [ -z "$root_seen" ] || die "only one Resolve root may be given"; R="$1"; root_seen=1; shift ;;
+                esac
+            done
+            PYTHON="$(pick_python)"
+            local -a status_args=(status --root "$R" --config "$AUTO_CONFIG" --result "$AUTO_RESULT" --marker "$R/.omarchy-resolve.json")
+            [ "$json" -eq 1 ] && status_args+=(--json)
+            [ "$require_active" -eq 1 ] && status_args+=(--require-active)
+            run_locked shared "$R" auto_python "${status_args[@]}"
+            ;;
+        enable)
+            ensure_root
+            PYTHON="$(pick_python)"
+            ensure_lock_file
+            auto_python set-mode --config "$AUTO_CONFIG" --mode enabled
+            need_cmd systemctl
+            systemctl daemon-reload
+            systemctl enable resolve-aacfix-reapply.service resolve-aacfix-reapply.path
+            local service_code=0 path_code=0
+            systemctl start resolve-aacfix-reapply.service || service_code=$?
+            systemctl start resolve-aacfix-reapply.path || path_code=$?
+            [ "$service_code" -eq 0 ] || die "could not start the AAC reapply service"
+            [ "$path_code" -eq 0 ] || die "could not start the AAC marker watcher"
+            ;;
+        disable)
+            ensure_root
+            PYTHON="$(pick_python)"
+            ensure_lock_file
+            auto_python set-mode --config "$AUTO_CONFIG" --mode disabled
+            need_cmd systemctl
+            systemctl daemon-reload
+            systemctl stop resolve-aacfix-reapply.path
+            run_locked exclusive "$DEFAULT_ROOT" systemctl stop resolve-aacfix-reapply.service
+            systemctl disable resolve-aacfix-reapply.service resolve-aacfix-reapply.path
+            ;;
+        reapply)
+            ensure_root
+            PYTHON="$(pick_patch_python)"
+            ensure_lock_file
+            run_locked exclusive "$DEFAULT_ROOT" auto_python reapply --root "$DEFAULT_ROOT" --config "$AUTO_CONFIG" --result "$AUTO_RESULT" --marker "$DEFAULT_ROOT/.omarchy-resolve.json" --lock "$AUTO_LOCK" --proc-root /proc
+            ;;
+        *) die "unknown auto command: $action" ;;
+    esac
 }
 
 # download + verify makeresolvedeb; echo its path on stdout
@@ -194,11 +389,13 @@ usage() {
 
 main() {
     ORIG_ARGS=("$@")
-    local cmd="${1:-}"; shift || true
+    local cmd="${1:-}"
+    shift || true
     case "$cmd" in
         install)   cmd_install   "$@" ;;
         uninstall) cmd_uninstall "$@" ;;
         status)    cmd_status    "$@" ;;
+        auto)      cmd_auto      "$@" ;;
         build-deb) cmd_build_deb "$@" ;;
         -h|--help|help|"") usage 0 ;;
         *) die "unknown subcommand: $cmd (try --help)" ;;

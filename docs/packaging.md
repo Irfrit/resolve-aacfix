@@ -22,8 +22,11 @@ aac-patch-tree revert <ROOT>
 aac-patch-tree status <ROOT>
 
 aac-fix install   [RESOLVE_ROOT]     # default /opt/resolve; re-execs via sudo if needed
-aac-fix status    [RESOLVE_ROOT]
+aac-fix status    [--json] [--require-active] [RESOLVE_ROOT]
 aac-fix uninstall [RESOLVE_ROOT]
+aac-fix auto status [--json] [--require-active]
+aac-fix auto enable
+aac-fix auto disable
 aac-fix build-deb INSTALLER.run [MAKERESOLVEDEB.sh]
 ```
 
@@ -39,8 +42,9 @@ where the backups would add roughly 670 MB of dead weight (a second copy of the
 653 MB binary). `revert` will not work afterwards; you revert by reinstalling the
 stock package.
 
-Re-running `apply` is safe either way: if the binary is already patched it
-re-patches **from the kept original**, never from the patched binary.
+Re-running `apply` is safe: a matching active generation is a true no-op and
+preserves file mtimes. If a scope or generation changes, the patch is rebuilt
+**from the kept original**, never from the patched binary.
 
 With `--originals remove` there is no kept original, so `apply` and `revert` both
 refuse and say so. That is not a gap to be closed — **e9patch has no unpatch**,
@@ -60,6 +64,29 @@ The workflows that mode is for do not need in-place re-patching anyway:
 `build-deb` always starts from a freshly-extracted installer, so it never has an
 already-patched binary to deal with.
 
+## Installed layout and automatic reapply
+
+`install.sh` verifies the release manifest, stages the self-contained payload
+under `/usr/lib/resolve-aacfix`, and installs `/usr/bin/aac-fix`,
+`systemd/`, `tmpfiles.d/`, and the fixed polkit action. Use
+`--no-auto-reapply` to install with a persistent opt-out.
+
+The auto-control state is deliberately separate from Resolve's lifecycle state:
+
+- `/etc/resolve-aacfix/auto.conf` stores `auto`, `enabled`, or `disabled`.
+- `/var/lib/resolve-aacfix/last-result.json` stores the last service result.
+- `/run/lock/omarchy-resolve.lock` coordinates installers and Resolve launchers.
+- `/opt/resolve/.omarchy-resolve.json` is the Omarchy installation trigger.
+
+The service is a oneshot with no retry loop. It defers successfully while Resolve
+is running, refuses unsupported Studio signatures without changing files, and
+never re-enables a persistent opt-out. `aac-fix auto status` reports the mode,
+marker, process state, patch state, and last result.
+
+`uninstall.sh` stops the service, restores a verified matching generation when
+possible, removes the package files, and refuses stale restores through the
+lifecycle core. It does not remove the runtime lock file.
+
 ## Safety properties worth preserving
 
 Everything below exists because the tool writes into a working Resolve install.
@@ -74,10 +101,10 @@ If you change this code, keep them.
   for, and deletes the output if they disagree. A binary with only some gates
   installed is worse than no binary: a redirect can jump into a gate that was
   never installed.
-- **Atomic everything.** The patched binary is written to `bin/resolve.aac-tmp`
-  and renamed. Backups are written to `.tmp` and renamed. A `cp` interrupted by
-  Ctrl-C, a full disk, or an OOM kill must never leave a truncated backup that a
-  later `revert` would install over a working binary.
+- **Transactional lifecycle.** Targets, backups, state, and checksum records are
+  staged first. Replacement libraries commit before the binary, state commits
+  last, directories are fsynced, and caught failures roll back the exact
+  preflight inventory. A matching active apply performs no renames.
 - **Backups are verified before use.** `revert` checks that the kept original is
   a valid, complete, unpatched ELF, and matches the SHA-256 recorded beside it,
   before restoring it. If it does not, it refuses and leaves the current binary
@@ -94,9 +121,10 @@ If you change this code, keep them.
   use `cp` rather than `cp -p` for the same reason: `cp -p` would preserve the
   *source* ownership, which under sudo actually succeeds.
 - **Environment overrides are ignored under sudo.** `AAC_E9TOOL`,
-  `AAC_TRAMPOLINE` and `AAC_LIBS` all select executable payload. Honouring them
-  when running as root via sudo would turn a restricted NOPASSWD sudoers rule for
-  this tool into a trivial root-code-execution primitive. Set
+  `AAC_TRAMPOLINE`, `AAC_LIBS`, and `AAC_LOCK_FILE` can select executable or
+  synchronization inputs. Honouring them when running as root via sudo would
+  turn a restricted NOPASSWD sudoers rule for this tool into a trivial
+  root-coordination primitive. Set
   `AAC_ALLOW_ENV_OVERRIDE=1` to opt in deliberately.
 - **The payload is checksummed.** A release tarball carries `SHA256SUMS` covering
   everything in `vendor/` and `prebuilt/`, and the tool refuses to patch if it
@@ -150,13 +178,15 @@ to keep in sync.
 
 ```
 aac-fix  aac-patch-tree      entry points
-aacpatch/                    signature engine + e9tool driver
+install.sh  uninstall.sh     installed-layout management
+aacpatch/                    signature, lifecycle, and auto-control
 src/trampoline/aacadd.c      the patch itself
 src/ffmpeg/                  build recipe + AV3A backport patch
 vendor/e9patch/{e9patch,e9tool}    built by CI
 vendor/aacadd                      compiled trampoline
 vendor/pylibs/{capstone,elftools}  so a release needs only python3
 prebuilt/ffmpeg-aac/*.so           built by CI
+systemd/ tmpfiles.d/ polkit/      automatic reapply integration
 tools/  docs/  scripts/  tests/
 ```
 

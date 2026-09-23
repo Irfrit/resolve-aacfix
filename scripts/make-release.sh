@@ -4,7 +4,7 @@
 #
 # Assemble the self-contained release tarball: the repo plus the built payload
 # in vendor/ and prebuilt/.  A user should be able to download it, extract it,
-# and run ./aac-fix install with nothing installed but python3 and binutils.
+# and run ./install.sh with nothing installed but python3 and binutils.
 #
 # Run scripts/dev-setup.sh (or let the release workflow do it) first; this only
 # packages what is already built, and refuses if anything is missing.
@@ -13,6 +13,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 ROOT="$(dirname "$HERE")"
+info() { printf '\033[1m==>\033[0m %s\n' "$*"; }
+die()  { printf '\033[31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 # shellcheck source=versions.sh
 . "$HERE/versions.sh"
 
@@ -35,9 +37,14 @@ done
 if [ -z "$VERSION" ]; then
     VERSION="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)"
 fi
-
-info() { printf '\033[1m==>\033[0m %s\n' "$*"; }
-die()  { printf '\033[31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
+if [ -f "$ROOT/VERSION" ]; then
+    EXPECTED_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+    case "$VERSION" in
+        dev|*dirty) ;;
+        "$EXPECTED_VERSION"|"v$EXPECTED_VERSION") ;;
+        *) die "release version $VERSION does not match VERSION ($EXPECTED_VERSION)" ;;
+    esac
+fi
 
 NAME="resolve-aacfix-${VERSION}-linux-x86_64"
 STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
@@ -49,17 +56,18 @@ info "Staging $NAME"
 # --- the repo itself.  git archive keeps .gitignore/.gitattributes honest and
 # guarantees we never ship a stray build artifact from the working tree.
 if git -C "$ROOT" rev-parse --verify -q HEAD >/dev/null 2>&1 && \
-   [ -z "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]; then
+   [ -z "$(git -C "$ROOT" status --porcelain)" ]; then
     git -C "$ROOT" archive --format=tar HEAD | tar -x -C "$DEST"
 else
     # dirty tree or no commits yet: copy the tracked-ish set by hand
     ( cd "$ROOT" && tar -c \
-        --exclude=.git --exclude=vendor --exclude=prebuilt \
+        --exclude=.git --exclude=vendor --exclude=prebuilt --exclude=HANDOFF.md \
         --exclude=dist --exclude=_ffmpeg --exclude=__pycache__ \
         --exclude='*.pyc' --exclude='*.so' --exclude=testdata \
         --exclude=.pytest_cache --exclude=.ruff_cache --exclude='*.whl' \
         . ) | tar -x -C "$DEST"
 fi
+rm -f "$DEST/HANDOFF.md"
 
 # --- payload: only what the installer needs, not the whole e9patch checkout
 info "Adding payload"

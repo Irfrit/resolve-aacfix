@@ -150,8 +150,11 @@ jobs:
           mkdir -p /tmp/smoke && tar -xzf dist/*.tar.gz -C /tmp/smoke
           pkg="$(echo /tmp/smoke/resolve-aacfix-*)"
           ( cd "$pkg" && sha256sum --quiet -c SHA256SUMS )
-          mkdir -p /tmp/fake/bin /tmp/fake/libs && cp /bin/bash /tmp/fake/bin/resolve
-          out="$("$pkg/aac-patch-tree" status /tmp/fake 2>&1)" || true
+           mkdir -p /tmp/fake/bin /tmp/fake/libs && cp /bin/bash /tmp/fake/bin/resolve
+           for lib in libavcodec.so.60.3.100 libavformat.so.60.3.100 libavutil.so.58.2.100 libswscale.so.7.1.100; do
+             cp /bin/bash "/tmp/fake/libs/$lib"
+           done
+           out="$("$pkg/aac-patch-tree" status /tmp/fake 2>&1)" || true
           echo "$out"
           echo "$out" | grep -q 'binary:  original'
           set +e
